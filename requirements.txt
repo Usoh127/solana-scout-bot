@@ -1,0 +1,34 @@
+# ── Telegram bot ─────────────────────────────────────────────────────────────
+python-telegram-bot[job-queue]==21.6
+
+# ── Async HTTP client ──────────────────────────────────────────────────────────
+aiohttp==3.10.5
+
+# ── Solana / Jupiter execution ─────────────────────────────────────────────────
+# solders: Rust-backed Solana primitives (keypair, transaction, pubkey)
+solders==0.21.0
+# base58 encoding/decoding for private key import
+base58==2.1.1
+
+# ── Sentiment analysis ─────────────────────────────────────────────────────────
+# VADER: fast rule-based sentiment, no API needed, no GPU
+vaderSentiment==3.3.2
+
+# ── Reddit ──────────────────────────────────────────────────────────────────────
+# PRAW: Python Reddit API Wrapper (free, register app at reddit.com/prefs/apps)
+praw==7.7.1
+
+# ── Twitter scraper fallback ───────────────────────────────────────────────────
+# ntscraper: Nitter-based scraper (no API key needed, less reliable)
+# ⚠️  Install separately if Twitter API v2 Bearer Token is not available:
+# pip install ntscraper
+# ntscraper is NOT listed as hard dependency since it requires Nitter instances
+# to be up. Omit if you have a Twitter API Bearer Token.
+# ntscraper==1.1.7
+
+# ── Config ──────────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+
+# ── Utils ───────────────────────────────────────────────────────────────────────
+# For async rate limiting (optional, used in extended retry logic)
+tenacity==9.0.0
