@@ -37,8 +37,28 @@ TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 # Known LP lock / burn programs on Solana
-BURN_ADDRESS = "1nc1nerator11111111111111111111111111111111"
+BURN_ADDRESS        = "1nc1nerator11111111111111111111111111111111"
 RAYDIUM_LOCK_PROGRAM = "7WduLbRfYhTJktjLw5FDEyrqoEv61aTTCuGAetgLjzN5"
+
+# SPL-Token-2022 dangerous extensions
+# Source: PumpSwap API documentation on token scam detection
+DANGEROUS_EXTENSIONS = {
+    "transferFeeConfig":            "charges fees on every transfer (common scam)",
+    "transferHook":                 "custom code runs on every transfer",
+    "permanentDelegate":            "permanent control over your tokens",
+    "defaultAccountState":          "can freeze accounts by default",
+    "memoTransfer":                 "requires memo — blocks most DEX sells",
+    "nonTransferable":              "tokens cannot be transferred",
+    "confidentialTransferMint":     "incompatible with pools",
+    "confidentialMintBurn":         "incompatible with pools",
+    "confidentialTransferFeeConfig": "incompatible with pools",
+    "pausableConfig":               "can pause all transfers",
+    "cpiGuard":                     "blocks program interactions",
+}
+
+# Pool creator safety rules
+# poolCreatedBy values that are safe per launchpad
+SAFE_POOL_CREATORS = {"pump", "raydium-launchpad", "meteora-launchpad"}
 
 # Minimal SPL Mint layout offsets (82 bytes total)
 MINT_LAYOUT_AUTHORITY_OFFSET = 4   # 36 bytes: COption<Pubkey> for mint authority
@@ -55,9 +75,13 @@ class SafetyResult:
     mint_authority_renounced: bool
     freeze_authority_renounced: bool
     top10_holder_pct: float
-    lp_burned: Optional[bool]       # None = could not determine
+    lp_burned: Optional[bool]        # None = could not determine
     is_honeypot: bool
-    detail: str                     # human-readable summary
+    detail: str                      # human-readable summary
+    dangerous_extensions: list       # SPL-2022 dangerous extensions found
+    token_program: str               # "spl-token" or "spl-token-2022"
+    pool_creator: str                # who created the pool
+    pool_fee_rate: float             # 0.0 = unknown
 
 
 class SafetyChecker:
@@ -258,22 +282,43 @@ class SafetyChecker:
 
     def _check_honeypot_heuristics(
         self,
-        mint_renounced: bool,
-        freeze_renounced: bool,
-        top10_pct: float,
-        lp_burned: Optional[bool],
-        birdeye_data: dict | None,
+        mint_renounced:      bool,
+        freeze_renounced:    bool,
+        top10_pct:           float,
+        lp_burned:           Optional[bool],
+        birdeye_data:        dict | None,
+        dangerous_extensions: list,
+        pool_warnings:       list,
     ) -> tuple[bool, list[str]]:
         """
         Returns (is_honeypot, list_of_red_flags).
-        A token is flagged as likely honeypot if 2+ red flags are present.
+
+        Instant fail (regardless of other flags):
+          - Any dangerous SPL-2022 extension present
+          - Freeze authority active
+
+        Fail if 2+ red flags from:
+          - Mint authority not renounced
+          - Top-10 holder concentration too high
+          - LP not burned/locked
+          - Pool warnings
         """
         red_flags: list[str] = []
+        instant_fail = False
 
-        if not mint_renounced:
-            red_flags.append("⚠️ Mint authority NOT renounced (tokens can be minted)")
+        # ── Instant disqualifiers ──────────────────────────────────────────────
+        if dangerous_extensions:
+            for ext in dangerous_extensions:
+                red_flags.append(f"🚨 DANGEROUS EXTENSION: {ext}")
+            instant_fail = True   # Any dangerous extension = auto-fail
+
         if not freeze_renounced:
-            red_flags.append("⚠️ Freeze authority active (accounts can be frozen)")
+            red_flags.append("🚨 Freeze authority ACTIVE — accounts can be frozen")
+            instant_fail = True   # Freeze authority = auto-fail
+
+        # ── Standard red flags ─────────────────────────────────────────────────
+        if not mint_renounced:
+            red_flags.append("⚠️ Mint authority NOT renounced (infinite mint risk)")
         if top10_pct > config.MAX_TOP_10_HOLDER_PCT:
             red_flags.append(
                 f"⚠️ Top-10 holders own {top10_pct:.1f}% (dump risk)"
@@ -281,61 +326,88 @@ class SafetyChecker:
         if lp_burned is False:
             red_flags.append("⚠️ LP not burned/locked (rug vector open)")
 
+        # Pool warnings
+        red_flags.extend(pool_warnings)
+
+        # Birdeye enrichment
         if birdeye_data:
-            if birdeye_data.get("mintable"):
-                if "⚠️ Mint authority NOT renounced (tokens can be minted)" not in red_flags:
-                    red_flags.append("⚠️ Token is mintable (Birdeye)")
-            if birdeye_data.get("freezable"):
-                if "⚠️ Freeze authority active (accounts can be frozen)" not in red_flags:
-                    red_flags.append("⚠️ Token is freezable (Birdeye)")
+            if birdeye_data.get("mintable") and mint_renounced:
+                red_flags.append("⚠️ Token is mintable (Birdeye)")
             creator_pct = float(birdeye_data.get("creatorPercentage") or 0)
             if creator_pct > 20:
                 red_flags.append(
-                    f"⚠️ Creator holds {creator_pct:.1f}% of supply (Birdeye)"
+                    f"⚠️ Creator holds {creator_pct:.1f}% of supply"
                 )
-            if not birdeye_data.get("lpBurned"):
-                if lp_burned is None:  # Don't double-count
-                    red_flags.append("⚠️ LP not burned (Birdeye)")
+            if not birdeye_data.get("lpBurned") and lp_burned is None:
+                red_flags.append("⚠️ LP not burned (Birdeye)")
 
-        is_honeypot = len(red_flags) >= 2
+        is_honeypot = instant_fail or len(red_flags) >= 2
         return is_honeypot, red_flags
 
     # ── Main check ────────────────────────────────────────────────────────────
 
     async def full_safety_check(
-        self, mint: str, pool_address: str = ""
+        self, mint: str, pool_address: str = "", dex_name: str = ""
     ) -> SafetyResult:
         """
         Run all safety checks in parallel. Returns a SafetyResult.
-        A token FAILS if is_honeypot=True (2+ red flags) OR if mint authority
-        is not renounced.
+
+        Auto-fails if:
+          - Any dangerous SPL-2022 extension detected
+          - Freeze authority is active
+          - Mint authority not renounced
+
+        Also fails if 2+ of:
+          - High holder concentration
+          - LP not burned
+          - Pool warnings (high fees, custom creator)
         """
         logger.info(f"[Safety] Running checks for {mint}")
 
-        birdeye_task = asyncio.create_task(self._check_birdeye_security(mint))
-        mint_task = asyncio.create_task(self._check_mint_authority(mint))
-        holder_task = asyncio.create_task(self._check_holder_concentration(mint))
-        lp_task = asyncio.create_task(self._check_lp_burned(pool_address))
-
-        birdeye_data, (mint_renounced, freeze_renounced), top10_pct, lp_burned = (
-            await asyncio.gather(
-                birdeye_task, mint_task, holder_task, lp_task,
-                return_exceptions=True,
-            )
+        birdeye_task    = asyncio.create_task(self._check_birdeye_security(mint))
+        mint_task       = asyncio.create_task(self._check_mint_authority(mint))
+        holder_task     = asyncio.create_task(self._check_holder_concentration(mint))
+        lp_task         = asyncio.create_task(self._check_lp_burned(pool_address))
+        extension_task  = asyncio.create_task(self._check_token_extensions(mint))
+        pool_task       = asyncio.create_task(
+            self._check_pool_safety(pool_address, dex_name)
         )
 
-        # Handle exceptions from gather
+        (
+            birdeye_data,
+            mint_auth_result,
+            top10_pct,
+            lp_burned,
+            extension_result,
+            pool_result,
+        ) = await asyncio.gather(
+            birdeye_task, mint_task, holder_task, lp_task,
+            extension_task, pool_task,
+            return_exceptions=True,
+        )
+
+        # Handle exceptions
         if isinstance(birdeye_data, Exception):
             logger.warning(f"[Safety] Birdeye failed: {birdeye_data}")
             birdeye_data = None
-        if isinstance(mint_renounced, Exception):
+        if isinstance(mint_auth_result, Exception):
             mint_renounced, freeze_renounced = False, False
+        else:
+            mint_renounced, freeze_renounced = mint_auth_result
         if isinstance(top10_pct, Exception):
             top10_pct = 0.0
         if isinstance(lp_burned, Exception):
             lp_burned = None
+        if isinstance(extension_result, Exception):
+            token_program, dangerous_extensions = "unknown", []
+        else:
+            token_program, dangerous_extensions = extension_result
+        if isinstance(pool_result, Exception):
+            pool_creator, pool_fee_rate, pool_warnings = "unknown", 0.0, []
+        else:
+            pool_creator, pool_fee_rate, pool_warnings = pool_result
 
-        # If Birdeye gives us data, prefer it for mint/freeze
+        # Birdeye overrides if available
         if birdeye_data:
             if birdeye_data.get("mintable") is not None:
                 mint_renounced = not birdeye_data["mintable"]
@@ -347,24 +419,36 @@ class SafetyChecker:
                 lp_burned = birdeye_data["lpBurned"]
 
         is_honeypot, red_flags = self._check_honeypot_heuristics(
-            mint_renounced, freeze_renounced, top10_pct, lp_burned, birdeye_data
+            mint_renounced, freeze_renounced, top10_pct,
+            lp_burned, birdeye_data, dangerous_extensions, pool_warnings
         )
 
-        # Build summary
+        # Build human-readable summary
         checks = []
+
+        # Token program
+        if token_program == "spl-token-2022":
+            if dangerous_extensions:
+                checks.append(f"🚨 SPL-Token-2022 with DANGEROUS extensions")
+            else:
+                checks.append(f"✅ SPL-Token-2022 (no dangerous extensions)")
+        elif token_program == "spl-token":
+            checks.append("✅ SPL-Token (standard)")
+
         checks.append(
-            "✅ Mint authority renounced" if mint_renounced else "❌ Mint NOT renounced"
+            "✅ Mint authority renounced"
+            if mint_renounced else "❌ Mint NOT renounced"
         )
         checks.append(
-            "✅ Freeze authority clear" if freeze_renounced else "❌ Freeze authority ACTIVE"
+            "✅ Freeze authority clear"
+            if freeze_renounced else "🚨 Freeze authority ACTIVE"
         )
         if top10_pct > 0:
-            checks.append(
-                f"{'✅' if top10_pct <= config.MAX_TOP_10_HOLDER_PCT else '❌'} "
-                f"Top-10 holders: {top10_pct:.1f}%"
-            )
+            icon = "✅" if top10_pct <= config.MAX_TOP_10_HOLDER_PCT else "❌"
+            checks.append(f"{icon} Top-10 holders: {top10_pct:.1f}%")
         else:
             checks.append("⚠️ Holder data unavailable")
+
         if lp_burned is True:
             checks.append("✅ LP burned/locked")
         elif lp_burned is False:
@@ -386,4 +470,8 @@ class SafetyChecker:
             lp_burned=lp_burned,
             is_honeypot=is_honeypot,
             detail=summary,
+            dangerous_extensions=dangerous_extensions,
+            token_program=token_program,
+            pool_creator=pool_creator,
+            pool_fee_rate=pool_fee_rate,
         )

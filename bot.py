@@ -467,7 +467,7 @@ async def _run_scan_cycle(
             try:
                 # Safety check
                 safety_result = await safety_checker.full_safety_check(
-                    opp.mint, opp.pool_address
+                    opp.mint, opp.pool_address, opp.dex
                 )
                 opp.safety_passed = safety_result.passed
                 opp.safety_detail = safety_result.detail
