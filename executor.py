@@ -119,47 +119,78 @@ class TradeExecutor:
         input_mint: str,
         output_mint: str,
         amount_lamports: int,
+        slippage_bps: Optional[int] = None,
     ) -> Optional[dict]:
         """
         Get best swap route from Jupiter v6.
-        Returns raw quote response dict or None on failure.
+        Retries with progressively higher slippage if initial quote fails.
+        Memecoins moving fast need higher slippage to route successfully.
         """
         session = await self._get_session()
-        params = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount_lamports),
-            "slippageBps": str(config.SLIPPAGE_BPS),
-            "onlyDirectRoutes": "false",
-            "asLegacyTransaction": "false",
-        }
-        for attempt in range(3):
-            try:
-                async with session.get(
-                    f"{JUPITER_BASE}/quote",
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json(content_type=None)
-                        logger.debug(
-                            f"[Executor] Quote: {input_mint[:8]} → {output_mint[:8]}, "
-                            f"impact={data.get('priceImpactPct', 'N/A')}%"
-                        )
-                        return data
-                    elif resp.status == 429:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    else:
-                        body = await resp.text()
-                        logger.warning(f"[Executor] Quote error {resp.status}: {body[:200]}")
-                        return None
-            except asyncio.TimeoutError:
-                logger.warning(f"[Executor] Quote timeout (attempt {attempt + 1})")
-                await asyncio.sleep(2)
-            except Exception as e:
-                logger.warning(f"[Executor] Quote error: {e}")
-                return None
+
+        # Slippage ladder: try configured slippage first, then escalate
+        # 300 bps = 3%, 500 = 5%, 1000 = 10%, 2000 = 20%
+        base_slippage = slippage_bps or config.SLIPPAGE_BPS
+        slippage_ladder = [base_slippage, 500, 1000, 2000]
+        # Remove duplicates while preserving order
+        seen = set()
+        slippage_ladder = [
+            x for x in slippage_ladder
+            if not (x in seen or seen.add(x))
+        ]
+
+        for slippage in slippage_ladder:
+            params = {
+                "inputMint":          input_mint,
+                "outputMint":         output_mint,
+                "amount":             str(amount_lamports),
+                "slippageBps":        str(slippage),
+                "onlyDirectRoutes":   "false",
+                "asLegacyTransaction": "false",
+            }
+            for attempt in range(2):
+                try:
+                    async with session.get(
+                        f"{JUPITER_BASE}/quote",
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            if slippage > base_slippage:
+                                logger.info(
+                                    f"[Executor] Quote succeeded with higher slippage "
+                                    f"{slippage}bps ({slippage/100:.0f}%)"
+                                )
+                            logger.debug(
+                                f"[Executor] Quote: {input_mint[:8]} to {output_mint[:8]}, "
+                                f"impact={data.get('priceImpactPct', 'N/A')}%"
+                            )
+                            return data
+                        elif resp.status == 429:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        else:
+                            body = await resp.text()
+                            logger.warning(
+                                f"[Executor] Quote failed {resp.status} "
+                                f"slippage={slippage}bps: {body[:150]}"
+                            )
+                            break  # Try next slippage tier
+                except asyncio.TimeoutError:
+                    logger.warning(f"[Executor] Quote timeout slippage={slippage}bps")
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    logger.warning(f"[Executor] Quote error: {e}")
+                    break
+
+            await asyncio.sleep(0.3)  # small delay between slippage tiers
+
+        logger.warning(
+            f"[Executor] All slippage tiers failed for {output_mint[:8]}. "
+            f"Token may not be routable on Jupiter yet — possibly too new or "
+            f"pool type unsupported."
+        )
         return None
 
     # ── Jupiter swap transaction ───────────────────────────────────────────────
