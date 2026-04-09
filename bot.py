@@ -93,31 +93,19 @@ def _fmt_usd(n: float) -> str:
 
 def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
     """
-    Score 1–10. Decomposes into:
-      on-chain safety      : 0–3 pts
-      price momentum       : 0–2 pts
-      social/sentiment     : 0–3 pts
-      liquidity/volume     : 0–2 pts
-
-    Hard penalties applied AFTER scoring:
-      - Top-10 holders > 60%  : -3 pts (extreme dump risk)
-      - Top-10 holders > 45%  : -2 pts (high dump risk)
-      - Top-10 holders > 35%  : -1 pt  (elevated dump risk)
-      - LP lock unverified    : -1 pt
+    Score 1-10 with hard penalties for holder concentration and LP issues.
     """
+    import re
     score = 0
     reasons = []
     penalties = []
 
-    # Safety
     if opp.safety_passed:
         score += 3
         reasons.append("clean on-chain ✅")
     else:
-        score += 0
         reasons.append("safety flags ❌")
 
-    # Momentum
     if opp.price_change_1h >= 50:
         score += 2
         reasons.append("ripping 1h momentum 🚀")
@@ -125,7 +113,6 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score += 1
         reasons.append("solid 1h momentum 📈")
 
-    # Sentiment
     if opp.sentiment_label == "Bullish" and opp.tweet_count >= 20:
         score += 3
         reasons.append("strong social signal 🔥")
@@ -136,10 +123,8 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score += 1
         reasons.append("neutral/quiet socials")
     elif opp.data_only_call:
-        score += 0
         reasons.append("⚠️ data-only (no socials)")
 
-    # Liquidity + volume ratio
     vol_liq_ratio = opp.volume_24h_usd / opp.liquidity_usd if opp.liquidity_usd > 0 else 0
     if vol_liq_ratio >= 2:
         score += 2
@@ -148,13 +133,10 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score += 1
         reasons.append("decent vol/liq")
 
-    # ── Hard penalties for holder concentration ──────────────────────────────
-    # Extract top-10 holder % from safety_detail string
     holder_pct = 0.0
     if opp.safety_detail:
         for line in opp.safety_detail.splitlines():
             if "Top-10 holders" in line or "top-10" in line.lower():
-                import re
                 match = re.search(r"(\d+\.?\d*)%", line)
                 if match:
                     holder_pct = float(match.group(1))
@@ -170,16 +152,12 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score -= 1
         penalties.append(f"⚠️ top-10 own {holder_pct:.0f}% — elevated dump risk")
 
-    # LP lock penalty
     if opp.safety_detail and "LP lock unverified" in opp.safety_detail:
         score -= 1
         penalties.append("⚠️ LP lock unverified")
 
     score = max(1, min(10, score))
-
-    # Build rationale: show top reasons + penalties
-    all_points = reasons[:2] + penalties[:2]
-    rationale = " · ".join(all_points)
+    rationale = " · ".join((reasons[:2] + penalties[:2]))
     return score, rationale
 
 
@@ -222,7 +200,6 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         twitter_block = "  └ 📭 No Twitter signal\n"
 
     reddit_block = f"  └ {html.escape(opp.reddit_summary)}\n" if opp.reddit_summary else ""
-    # News relabeled as Market Context — rarely token-specific for new memes
     news_block = (
         f"\n🌐 <b>Market Context</b> <i>(general, not token-specific)</i>\n"
         f"  └ {html.escape(opp.news_summary)}\n"
@@ -705,6 +682,8 @@ async def _handle_confirm_buy(query, context, mint: str):
             amount_sol_spent=result.input_amount,
             liquidity_at_buy=opp.liquidity_usd,
             tx_hash=result.tx_hash,
+            token_age_at_buy=opp.age_hours,
+            volume_at_buy=opp.volume_1h_usd,
         )
         monitor.add_position(position)
         logger.info(f"[Bot] Position opened: {opp.symbol}")
@@ -796,6 +775,9 @@ def main():
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
         .build()
     )
 
