@@ -29,9 +29,13 @@ from config import config
 
 logger = logging.getLogger(__name__)
 
-JUPITER_BASE = "https://quote-api.jup.ag/v6"
-WSOL_MINT = "So11111111111111111111111111111111111111112"
-SOL_DECIMALS = 9
+JUPITER_BASE    = "https://quote-api.jup.ag/v6"
+PUMPPORTAL_BASE = "https://pumpportal.fun/api"
+WSOL_MINT       = "So11111111111111111111111111111111111111112"
+SOL_DECIMALS    = 9
+
+# DEX identifiers that route through PumpPortal directly
+PUMP_DEX_IDS = {"pump-fun", "pumpswap", "pump_fun", "pump fun"}
 
 # Confirmation polling
 MAX_CONFIRM_RETRIES = 30
@@ -323,6 +327,140 @@ class TradeExecutor:
         logger.warning(f"[Executor] Tx confirmation timeout for {signature}")
         return False
 
+    # ── PumpPortal direct buy (PumpSwap tokens) ───────────────────────────────
+
+    async def _buy_via_pumpportal(
+        self, mint: str, amount_sol: float
+    ) -> TradeResult:
+        """
+        Direct buy through PumpPortal for PumpSwap tokens.
+        Works instantly on new launches — no Jupiter indexing delay.
+        Returns a serialized transaction we sign and send ourselves.
+        """
+        if not self._pubkey:
+            return TradeResult(success=False, error="Wallet not loaded.")
+
+        session = await self._get_session()
+        payload = {
+            "publicKey":        self._pubkey,
+            "action":           "buy",
+            "mint":             mint,
+            "amount":           amount_sol,
+            "denominatedInSol": "true",
+            "slippage":         10,
+            "priorityFee":      0.0001,
+            "pool":             "pump",
+        }
+        try:
+            async with session.post(
+                f"{PUMPPORTAL_BASE}/trade-local",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(
+                        f"[Executor] PumpPortal buy failed {resp.status}: {body[:200]}"
+                    )
+                    return TradeResult(
+                        success=False,
+                        error=f"PumpPortal error {resp.status}: {body[:100]}"
+                    )
+
+                # PumpPortal returns raw transaction bytes
+                tx_bytes = await resp.read()
+                if not tx_bytes:
+                    return TradeResult(success=False, error="PumpPortal returned empty response")
+
+                # Convert to base64 for our sign_and_send method
+                import base64
+                tx_b64 = base64.b64encode(tx_bytes).decode()
+
+                logger.info(f"[Executor] PumpPortal quote OK for {mint[:8]}, signing...")
+                sig = await self._sign_and_send(tx_b64)
+                if not sig:
+                    return TradeResult(success=False, error="Failed to sign/send PumpPortal tx")
+
+                confirmed = await self._confirm_transaction(sig)
+                if not confirmed:
+                    return TradeResult(
+                        success=False,
+                        tx_hash=sig,
+                        error="PumpPortal tx sent but confirmation timed out. Check tx manually.",
+                    )
+
+                return TradeResult(
+                    success=True,
+                    tx_hash=sig,
+                    input_amount=amount_sol,
+                    output_amount=0.0,   # PumpPortal doesn't return token amount in quote
+                    price_impact_pct=0.0,
+                    route_label="PumpPortal direct",
+                )
+
+        except Exception as e:
+            logger.warning(f"[Executor] PumpPortal buy error: {e}")
+            return TradeResult(success=False, error=f"PumpPortal error: {str(e)}")
+
+    # ── PumpPortal direct sell (PumpSwap tokens) ───────────────────────────────
+
+    async def _sell_via_pumpportal(
+        self, mint: str, token_amount: float
+    ) -> TradeResult:
+        """
+        Direct sell through PumpPortal for PumpSwap tokens.
+        Used when Jupiter can't route the sell on newly launched tokens.
+        """
+        if not self._pubkey:
+            return TradeResult(success=False, error="Wallet not loaded.")
+
+        session = await self._get_session()
+        payload = {
+            "publicKey":        self._pubkey,
+            "action":           "sell",
+            "mint":             mint,
+            "amount":           token_amount,
+            "denominatedInSol": "false",
+            "slippage":         10,
+            "priorityFee":      0.0001,
+            "pool":             "pump",
+        }
+        try:
+            async with session.post(
+                f"{PUMPPORTAL_BASE}/trade-local",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return TradeResult(
+                        success=False,
+                        error=f"PumpPortal sell error {resp.status}: {body[:100]}"
+                    )
+
+                import base64
+                tx_bytes = await resp.read()
+                tx_b64   = base64.b64encode(tx_bytes).decode()
+
+                sig = await self._sign_and_send(tx_b64)
+                if not sig:
+                    return TradeResult(success=False, error="Failed to sign/send PumpPortal sell tx")
+
+                confirmed = await self._confirm_transaction(sig)
+                return TradeResult(
+                    success=confirmed,
+                    tx_hash=sig,
+                    input_amount=token_amount,
+                    output_amount=0.0,
+                    price_impact_pct=0.0,
+                    route_label="PumpPortal direct",
+                    error="" if confirmed else "Sell sent but not confirmed in time.",
+                )
+
+        except Exception as e:
+            logger.warning(f"[Executor] PumpPortal sell error: {e}")
+            return TradeResult(success=False, error=f"PumpPortal sell error: {str(e)}")
+
     # ── Public API: buy ────────────────────────────────────────────────────────
 
     async def buy_token(self, mint: str, amount_sol: Optional[float] = None) -> TradeResult:
@@ -334,13 +472,18 @@ class TradeExecutor:
             return TradeResult(success=False, error="Wallet not loaded. Check WALLET_PRIVATE_KEY in .env.")
 
         sol_amount = amount_sol or config.BUY_AMOUNT_SOL
-        lamports = int(sol_amount * 10 ** SOL_DECIMALS)
+        lamports   = int(sol_amount * 10 ** SOL_DECIMALS)
 
         logger.info(f"[Executor] BUY {sol_amount} SOL → {mint}")
 
         quote = await self.get_quote(WSOL_MINT, mint, lamports)
         if not quote:
-            return TradeResult(success=False, error="Failed to get quote from Jupiter.")
+            # Jupiter failed — try PumpPortal as fallback
+            logger.info(
+                f"[Executor] Jupiter quote failed for {mint[:8]}, "
+                f"trying PumpPortal direct route..."
+            )
+            return await self._buy_via_pumpportal(mint, sol_amount)
 
         price_impact = float(quote.get("priceImpactPct") or 0)
         if price_impact > 10:
@@ -410,7 +553,12 @@ class TradeExecutor:
 
         quote = await self.get_quote(mint, WSOL_MINT, amount_units)
         if not quote:
-            return TradeResult(success=False, error="Failed to get sell quote from Jupiter.")
+            # Jupiter failed — try PumpPortal as fallback for sell
+            logger.info(
+                f"[Executor] Jupiter sell quote failed for {mint[:8]}, "
+                f"trying PumpPortal direct sell..."
+            )
+            return await self._sell_via_pumpportal(mint, token_amount)
 
         price_impact = float(quote.get("priceImpactPct") or 0)
         # On sells during a rug, price impact will be massive — still execute
