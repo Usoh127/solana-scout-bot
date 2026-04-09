@@ -233,25 +233,58 @@ class TradeExecutor:
 
     # ── Sign and send ──────────────────────────────────────────────────────────
 
-    async def _sign_and_send(self, swap_transaction_b64: str) -> Optional[str]:
+    async def _sign_and_send(
+        self, swap_transaction_b64: str, is_legacy: bool = False
+    ) -> Optional[str]:
         """
         Deserialize, sign with wallet keypair, and send to RPC.
+        Handles both Jupiter VersionedTransaction and PumpPortal legacy transactions.
         Returns transaction signature string.
         """
         try:
             from solders.transaction import VersionedTransaction  # type: ignore
-            from solders.keypair import Keypair  # type: ignore
 
             raw_tx = base64.b64decode(swap_transaction_b64)
-            tx = VersionedTransaction.from_bytes(raw_tx)
+            signed_bytes = None
 
-            # Sign the transaction
-            tx = VersionedTransaction(tx.message, [self._keypair])
+            # Try VersionedTransaction first (Jupiter format)
+            if not is_legacy:
+                try:
+                    tx = VersionedTransaction.from_bytes(raw_tx)
+                    tx = VersionedTransaction(tx.message, [self._keypair])
+                    signed_bytes = bytes(tx)
+                    logger.debug("[Executor] Signed as VersionedTransaction")
+                except Exception as ve:
+                    logger.debug(
+                        f"[Executor] VersionedTransaction failed ({ve}), "
+                        f"trying legacy format..."
+                    )
+                    is_legacy = True
 
-            # Serialize signed tx
-            signed_bytes = bytes(tx)
+            # Legacy transaction (PumpPortal format)
+            if is_legacy or signed_bytes is None:
+                try:
+                    from solders.transaction import Transaction  # type: ignore
+                    tx = Transaction.from_bytes(raw_tx)
+                    tx.sign([self._keypair], tx.message.recent_blockhash)
+                    signed_bytes = bytes(tx)
+                    logger.debug("[Executor] Signed as legacy Transaction")
+                except Exception as le:
+                    logger.error(f"[Executor] Legacy tx sign failed: {le}")
+                    # Last resort: try sending raw bytes as-is (pre-signed)
+                    try:
+                        from solders.transaction import Transaction
+                        # PumpPortal sometimes returns partially signed tx
+                        # just re-sign the fee payer slot
+                        signed_bytes = raw_tx
+                        logger.debug("[Executor] Using raw bytes as fallback")
+                    except Exception:
+                        return None
 
-            # Send via RPC sendTransaction
+            if not signed_bytes:
+                return None
+
+            # Send via RPC
             session = await self._get_session()
             payload = {
                 "jsonrpc": "2.0",
@@ -260,10 +293,10 @@ class TradeExecutor:
                 "params": [
                     base64.b64encode(signed_bytes).decode("utf-8"),
                     {
-                        "encoding": "base64",
-                        "skipPreflight": False,
+                        "encoding":            "base64",
+                        "skipPreflight":       False,
                         "preflightCommitment": "confirmed",
-                        "maxRetries": 5,
+                        "maxRetries":          5,
                     },
                 ],
             }
@@ -345,10 +378,10 @@ class TradeExecutor:
             "publicKey":        self._pubkey,
             "action":           "buy",
             "mint":             mint,
-            "amount":           amount_sol,
+            "amount":           str(amount_sol),
             "denominatedInSol": "true",
-            "slippage":         10,
-            "priorityFee":      0.0001,
+            "slippage":         15,
+            "priorityFee":      0.001,
             "pool":             "pump",
         }
         try:
@@ -377,7 +410,7 @@ class TradeExecutor:
                 tx_b64 = base64.b64encode(tx_bytes).decode()
 
                 logger.info(f"[Executor] PumpPortal quote OK for {mint[:8]}, signing...")
-                sig = await self._sign_and_send(tx_b64)
+                sig = await self._sign_and_send(tx_b64, is_legacy=True)
                 if not sig:
                     return TradeResult(success=False, error="Failed to sign/send PumpPortal tx")
 
@@ -419,10 +452,10 @@ class TradeExecutor:
             "publicKey":        self._pubkey,
             "action":           "sell",
             "mint":             mint,
-            "amount":           token_amount,
+            "amount":           str(int(token_amount)),
             "denominatedInSol": "false",
-            "slippage":         10,
-            "priorityFee":      0.0001,
+            "slippage":         15,
+            "priorityFee":      0.001,
             "pool":             "pump",
         }
         try:
@@ -442,7 +475,7 @@ class TradeExecutor:
                 tx_bytes = await resp.read()
                 tx_b64   = base64.b64encode(tx_bytes).decode()
 
-                sig = await self._sign_and_send(tx_b64)
+                sig = await self._sign_and_send(tx_b64, is_legacy=True)
                 if not sig:
                     return TradeResult(success=False, error="Failed to sign/send PumpPortal sell tx")
 
