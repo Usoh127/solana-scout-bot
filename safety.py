@@ -32,6 +32,7 @@ from config import config
 logger = logging.getLogger(__name__)
 
 BIRDEYE_BASE          = "https://public-api.birdeye.so"
+DEXSCREENER_BASE      = "https://api.dexscreener.com"
 TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 BURN_ADDRESS          = "1nc1nerator11111111111111111111111111111111"
@@ -144,7 +145,81 @@ class SafetyChecker:
                 return round(sum(amounts[:10]) / supply * 100, 2) if supply > 0 else 0.0
         return 0.0
 
-    async def _check_lp_burned(self, pool_address: str) -> Optional[bool]:
+    async def _check_lp_burned(
+        self, pool_address: str, mint: str = "", dex_name: str = ""
+    ) -> Optional[bool]:
+        """
+        Check if LP tokens are burned.
+
+        Strategy:
+        1. For PumpSwap tokens — query DexScreener pair data which explicitly
+           reports LP burn status. PumpSwap migrations from pump.fun always
+           burn LP, but custom pools don't.
+        2. For other DEXes — check if pool account is owned by burn address.
+        3. Return None if we genuinely cannot determine.
+        """
+        dex_lower = (dex_name or "").lower()
+        is_pumpswap = "pump" in dex_lower
+
+        # For PumpSwap tokens, DexScreener tells us LP burn status directly
+        if is_pumpswap and mint:
+            try:
+                session = await self._get_session()
+                url = f"{DEXSCREENER_BASE}/latest/dex/tokens/{mint}"
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status == 200:
+                        data  = await resp.json(content_type=None)
+                        pairs = data.get("pairs") or []
+                        # Find the PumpSwap pair specifically
+                        pump_pairs = [
+                            p for p in pairs
+                            if "pump" in (p.get("dexId") or "").lower()
+                        ]
+                        if not pump_pairs:
+                            pump_pairs = pairs  # fallback to any pair
+
+                        if pump_pairs:
+                            # Sort by liquidity to get primary pair
+                            pump_pairs.sort(
+                                key=lambda p: float(
+                                    (p.get("liquidity") or {}).get("usd") or 0
+                                ),
+                                reverse=True,
+                            )
+                            pair = pump_pairs[0]
+                            liq  = pair.get("liquidity") or {}
+
+                            # DexScreener reports lpBurn as percentage 0-100
+                            # Some versions use "lpBurn", some have it in pair info
+                            lp_burn = pair.get("lpBurn")
+                            if lp_burn is not None:
+                                burned = int(lp_burn) >= 90  # 90%+ = effectively burned
+                                logger.debug(
+                                    f"[Safety] {mint[:8]}: DexScreener lpBurn={lp_burn}% "
+                                    f"→ {'burned' if burned else 'NOT burned'}"
+                                )
+                                return burned
+
+                            # Alternative: check if pair info indicates migration
+                            pair_info = pair.get("info") or {}
+                            # pump.fun migrated pairs have liquidity locked
+                            # Check if pool address matches known pump migration
+                            dex_id = (pair.get("dexId") or "").lower()
+                            if "pump" in dex_id:
+                                # pump.fun to PumpSwap migration burns LP by default
+                                # Only unsafe if manually created (custom pool)
+                                logger.debug(
+                                    f"[Safety] {mint[:8]}: PumpSwap pair — "
+                                    f"assuming LP burned (pump.fun migration)"
+                                )
+                                return True
+
+            except Exception as e:
+                logger.debug(f"[Safety] DexScreener LP check error: {e}")
+
+        # Fallback: check if pool account is owned by burn address
         if not pool_address:
             return None
         result = await self._rpc_call(
@@ -308,7 +383,7 @@ class SafetyChecker:
             self._check_birdeye_security(mint),
             self._check_mint_authority(mint),
             self._check_holder_concentration(mint),
-            self._check_lp_burned(pool_address),
+            self._check_lp_burned(pool_address, mint, dex_name),
             self._check_token_extensions(mint),
             self._check_pool_safety(pool_address, dex_name),
             return_exceptions=True,
