@@ -623,8 +623,10 @@ async def _handle_buy_intent(query, context, mint: str):
     # Build confirmation message
     conf_text = (
         f"⚠️ <b>CONFIRM BUY</b>\n\n"
-        f"You're about to buy <b>${html.escape(opp.symbol)}</b>\n"
-        f"Token:  <code>{opp.mint}</code>\n"
+        f"Name:   <b>{html.escape(opp.name)}</b>\n"
+        f"Ticker: <b>${html.escape(opp.symbol)}</b>\n"
+        f"CA:     <code>{opp.mint}</code>\n"
+        f"DEX:    {html.escape(opp.dex.title())}\n\n"
         f"Amount: <b>{config.BUY_AMOUNT_SOL} SOL</b>\n"
         f"Price:  <code>${opp.price_usd:.8f}</code>\n"
         f"Slippage: {config.SLIPPAGE_BPS / 100:.1f}%\n\n"
@@ -661,11 +663,14 @@ async def _handle_confirm_buy(query, context, mint: str):
         tx_link = f"https://solscan.io/tx/{result.tx_hash}"
         await query.edit_message_text(
             f"✅ <b>Buy executed!</b>\n\n"
-            f"Token: <b>${html.escape(opp.symbol)}</b>\n"
-            f"Spent: <b>{result.input_amount:.4f} SOL</b>\n"
-            f"Got:   <code>{result.output_amount:,.2f}</code> tokens\n"
-            f"Impact: {result.price_impact_pct:.2f}%\n"
-            f"Route: {html.escape(result.route_label)}\n\n"
+            f"Name:   <b>{html.escape(opp.name)}</b>\n"
+            f"Ticker: <b>${html.escape(opp.symbol)}</b>\n"
+            f"CA:     <code>{opp.mint}</code>\n"
+            f"DEX:    {html.escape(opp.dex.title())}\n\n"
+            f"Spent:  <b>{result.input_amount:.4f} SOL</b>\n"
+            f"Got:    <code>{result.output_amount:,.2f}</code> tokens\n"
+            f"Price:  <code>${opp.price_usd:.8f}</code>\n"
+            f"Route:  {html.escape(result.route_label)}\n\n"
             f"🔗 <a href='{tx_link}'>View on Solscan</a>",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
