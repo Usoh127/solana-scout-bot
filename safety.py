@@ -368,8 +368,23 @@ class SafetyChecker:
         if red_flags:
             summary += "\n\nRed flags:\n" + "\n".join(red_flags)
 
+        final_passed = not is_honeypot and mint_renounced
+        if not final_passed:
+            reasons = []
+            if not mint_renounced:
+                reasons.append("mint not renounced")
+            if dangerous_extensions:
+                reasons.append(f"dangerous extensions: {len(dangerous_extensions)}")
+            if not freeze_renounced:
+                reasons.append("freeze authority active")
+            if is_honeypot and red_flags:
+                reasons.append(f"{len(red_flags)} red flags")
+            logger.info(
+                f"[Safety] {mint[:8]} FAILED: {', '.join(reasons)}"
+            )
+
         return SafetyResult(
-            passed=not is_honeypot and mint_renounced,
+            passed=final_passed,
             mint_authority_renounced=mint_renounced,
             freeze_authority_renounced=freeze_renounced,
             top10_holder_pct=top10_pct,
