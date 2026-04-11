@@ -173,6 +173,7 @@ class TokenScout:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._seen_mints: dict[str, float] = {}  # mint -> last_alerted timestamp
+        self._scan_count: int = 0  # used to stagger GeckoTerminal calls
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -276,49 +277,40 @@ class TokenScout:
         logger.info(f"[Scout] GeckoTerminal returned {len(pools)} raw pools")
         return pools
 
-    # ── Source 2: DexScreener new pairs on PumpSwap / Meteora ─────────────────
+    # ── Source 2: DexScreener boosted / trending ───────────────────────────────
 
     async def _fetch_dexscreener_trending(self) -> list[dict]:
         """
-        Fetch NEW pairs from PumpSwap, Meteora, Orca and Raydium via DexScreener.
-        Catches tokens early — before they trend — by watching DEX-specific new pair feeds.
+        Fetch trending Solana pairs from DexScreener.
+        Uses the token-boosts and latest-boosted endpoint.
         Free, no key needed.
         """
         session = await self._get_session()
         results = []
 
-        dex_targets = ["pump-fun", "meteora", "meteora-dlmm", "orca", "raydium"]
-
-        for dex_id in dex_targets:
-            url = f"{DEXSCREENER_BASE}/latest/dex/search"
-            params = {"q": f"SOL {dex_id}"}
-            data = await _get_json(session, url, params=params)
-            if not data:
-                continue
-
-            pairs = data.get("pairs") or []
-
-            # Only Solana pairs from our target DEXes
-            solana_pairs = [
-                p for p in pairs
-                if p.get("chainId", "").lower() == "solana"
-                and p.get("dexId", "").lower() in dex_targets
+        # Endpoint: latest boosted tokens
+        url = f"{DEXSCREENER_BASE}/token-boosts/latest/v1"
+        data = await _get_json(session, url)
+        if data and isinstance(data, list):
+            solana_tokens = [
+                t for t in data if t.get("chainId", "").lower() == "solana"
             ]
+            # Fetch pair data for each token address
+            addrs = [t["tokenAddress"] for t in solana_tokens[:20] if t.get("tokenAddress")]
+            if addrs:
+                chunk = ",".join(addrs[:10])  # DexScreener allows up to 30
+                detail_url = f"{DEXSCREENER_BASE}/latest/dex/tokens/{chunk}"
+                detail_data = await _get_json(session, detail_url)
+                if detail_data:
+                    pairs = detail_data.get("pairs") or []
+                    for pair in pairs:
+                        if pair.get("chainId", "").lower() != "solana":
+                            continue
+                        parsed = self._parse_dexscreener_pair(pair)
+                        if parsed:
+                            results.append(parsed)
 
-            # Sort by creation time — newest first
-            solana_pairs.sort(
-                key=lambda p: int(p.get("pairCreatedAt") or 0),
-                reverse=True
-            )
-
-            for pair in solana_pairs[:15]:  # top 15 newest per DEX
-                parsed = self._parse_dexscreener_pair(pair)
-                if parsed:
-                    results.append(parsed)
-
-            await asyncio.sleep(0.3)  # be polite to DexScreener
-
-        logger.info(f"[Scout] DexScreener new pairs returned {len(results)} pairs")
+        logger.info(f"[Scout] DexScreener trending returned {len(results)} pairs")
         return results
 
     async def fetch_token_details_dexscreener(self, mint: str) -> dict | None:
@@ -484,16 +476,29 @@ class TokenScout:
         Full scan cycle. Returns list of TokenOpportunity objects that have
         passed ALL configured thresholds and are not on cooldown.
         """
-        logger.info("[Scout] Starting scan cycle…")
+        self._scan_count += 1
+        logger.info(f"[Scout] Starting scan cycle {self._scan_count}…")
 
-        # Gather from all sources in parallel
-        gecko_task = asyncio.create_task(self._fetch_gecko_new_pools())
-        dex_task = asyncio.create_task(self._fetch_dexscreener_trending())
-        bird_task = asyncio.create_task(self._fetch_birdeye_trending())
+        # GeckoTerminal: only every 2nd scan to avoid rate limiting
+        # DexScreener: every scan (no rate limits)
+        # Birdeye: every scan if key available
+        run_gecko = (self._scan_count % 2 == 1)
 
-        gecko_results, dex_results, bird_results = await asyncio.gather(
-            gecko_task, dex_task, bird_task, return_exceptions=True
-        )
+        if run_gecko:
+            gecko_task = asyncio.create_task(self._fetch_gecko_new_pools())
+            dex_task   = asyncio.create_task(self._fetch_dexscreener_trending())
+            bird_task  = asyncio.create_task(self._fetch_birdeye_trending())
+            gecko_results, dex_results, bird_results = await asyncio.gather(
+                gecko_task, dex_task, bird_task, return_exceptions=True
+            )
+        else:
+            logger.debug("[Scout] Skipping GeckoTerminal this cycle (rate limit protection)")
+            dex_task  = asyncio.create_task(self._fetch_dexscreener_trending())
+            bird_task = asyncio.create_task(self._fetch_birdeye_trending())
+            dex_results, bird_results = await asyncio.gather(
+                dex_task, bird_task, return_exceptions=True
+            )
+            gecko_results = []
 
         raw: list[dict] = []
         for result in [gecko_results, dex_results, bird_results]:
