@@ -566,43 +566,74 @@ class PositionMonitor:
                 self.remove_position(mint)
             return auto_alert
 
-        # ── Manual alert checks (require user to tap SELL) ────────────────────
+        # ── Auto stop loss — executes immediately, no tap needed ────────────────
         alert: Optional[MonitorAlert] = None
 
-        # Stop loss — dynamic: tighter for new tokens
+        # Dynamic stop loss: tighter for newer tokens
         stop_pct = config.STOP_LOSS_PCT
-        if pos.token_age_at_buy < (5 / 60):   # under 5min at buy
+        if pos.token_age_at_buy < (5 / 60):   # under 5min old at buy
             stop_pct = min(stop_pct, 10.0)
-        elif pos.token_age_at_buy < 0.5:       # under 30min at buy
+        elif pos.token_age_at_buy < 0.5:       # under 30min old at buy
             stop_pct = min(stop_pct, 12.0)
 
         if not pos.stop_loss_alerted and pct_change <= -stop_pct:
+            logger.warning(
+                f"[Monitor] STOP LOSS AUTO-EXIT: {pos.symbol} "
+                f"down {pct_change:.1f}% — selling immediately"
+            )
+            ok, detail = await self._auto_sell(
+                pos, pos.tokens_remaining, f"stop loss -{stop_pct}%"
+            )
+            pnl_str = f"{pct_change:+.1f}%"
+            msg = (
+                f"🛑 <b>STOP LOSS — AUTO EXIT</b>\n\n"
+                f"Token: <b>${pos.symbol}</b>\n"
+                f"Down {abs(pct_change):.1f}% from buy price\n"
+                f"Buy:  ${buy_price:.8f}\n"
+                f"Exit: ${current_price:.8f}\n"
+                f"PnL:  {pnl_str}\n\n"
+                f"{'Auto-sold all remaining tokens' if ok else 'SELL FAILED — act manually now!'}\n"
+                f"{detail}"
+            )
+            pos.stop_loss_alerted = True
             alert = MonitorAlert(
                 mint=mint, symbol=pos.symbol,
                 alert_type=ALERT_STOP_LOSS,
                 current_price=current_price, buy_price=buy_price,
                 pct_change=pct_change, current_liquidity=current_liq,
-                liquidity_drop_pct=liq_drop,
-                message=(
-                    f"🛑 Stop loss hit! {pos.symbol} down {pct_change:.1f}% "
-                    f"from buy (${buy_price:.8f} to ${current_price:.8f})"
-                ),
+                liquidity_drop_pct=liq_drop, message=msg,
             )
-            pos.stop_loss_alerted = True
+            if ok:
+                self.remove_position(mint)
 
+        # ── Auto liquidity exit — rug in progress, no tap needed ──────────────
         elif not pos.liquidity_alerted and liq_drop >= config.LIQUIDITY_DROP_ALERT_PCT:
+            logger.warning(
+                f"[Monitor] LIQUIDITY RUG AUTO-EXIT: {pos.symbol} "
+                f"liq down {liq_drop:.1f}% — selling immediately"
+            )
+            ok, detail = await self._auto_sell(
+                pos, pos.tokens_remaining, f"liquidity rug -{liq_drop:.0f}%"
+            )
+            msg = (
+                f"🚨 <b>LIQUIDITY RUG — AUTO EXIT</b>\n\n"
+                f"Token: <b>${pos.symbol}</b>\n"
+                f"Liquidity dropped {liq_drop:.1f}%\n"
+                f"Was: ${liq_at_buy:,.0f} → Now: ${current_liq:,.0f}\n"
+                f"PnL: {pct_change:+.1f}%\n\n"
+                f"{'Auto-sold all remaining tokens' if ok else 'SELL FAILED — act manually now!'}\n"
+                f"{detail}"
+            )
+            pos.liquidity_alerted = True
             alert = MonitorAlert(
                 mint=mint, symbol=pos.symbol,
                 alert_type=ALERT_LIQUIDITY_DROP,
                 current_price=current_price, buy_price=buy_price,
                 pct_change=pct_change, current_liquidity=current_liq,
-                liquidity_drop_pct=liq_drop,
-                message=(
-                    f"🚨 Liquidity alarm! {pos.symbol} liq dropped "
-                    f"{liq_drop:.1f}% — ${liq_at_buy:,.0f} to ${current_liq:,.0f}"
-                ),
+                liquidity_drop_pct=liq_drop, message=msg,
             )
-            pos.liquidity_alerted = True
+            if ok:
+                self.remove_position(mint)
 
         elif not pos.dump_alerted:
             if time.time() - pos.last_alert_time >= 300:
