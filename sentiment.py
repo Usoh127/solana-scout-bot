@@ -74,7 +74,15 @@ class SentimentResult:
 class SentimentAnalyzer:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
-        self._reddit = None
+        self._reddit  = None
+
+        # ── Caches to protect free tier rate limits ───────────────────────────
+        # NewsAPI: 100 req/day — cache results per ticker for 12 hours
+        self._news_cache:    dict[str, tuple[float, tuple]] = {}
+        # Twitter: 10 req/15min — cache per ticker for 15 minutes
+        self._twitter_cache: dict[str, tuple[float, tuple]] = {}
+        # Track if NewsAPI is rate limited today — stop hitting it until midnight
+        self._newsapi_blocked_until: float = 0.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -130,10 +138,20 @@ class SentimentAnalyzer:
     ) -> tuple[int, float, str, bool]:
         """
         Returns (tweet_count, avg_sentiment, top_signal, has_notable_account).
-        ⚠️  FREE TIER: 10 requests/15min, 500k tweets/month.
+        Cache results per ticker for 15 minutes to protect the 10 req/15min limit.
         """
         if not config.has_twitter:
             return 0, 0.0, "", False
+
+        # Check cache — 15 min TTL matches Twitter rate limit window
+        now = time.time()
+        cache_key = ticker.upper()
+        cached = self._twitter_cache.get(cache_key)
+        if cached:
+            cached_at, result = cached
+            if now - cached_at < 900:  # 15 minutes
+                logger.debug(f"[Sentiment] Twitter cache hit for {ticker}")
+                return result
 
         session = await self._get_session()
         headers = {"Authorization": f"Bearer {config.TWITTER_BEARER_TOKEN}"}
@@ -189,7 +207,9 @@ class SentimentAnalyzer:
             await asyncio.sleep(0.3)
 
         if not tweets:
-            return 0, 0.0, "", False
+            result = (0, 0.0, "", False)
+            self._twitter_cache[ticker.upper()] = (time.time(), result)
+            return result
 
         texts = [t.get("text", "") for t in tweets]
         avg_score, _ = self._score_texts(texts)
@@ -219,7 +239,9 @@ class SentimentAnalyzer:
                 if followers >= 10000:
                     has_notable = True
 
-        return len(tweets), avg_score, top_tweet, has_notable
+        result = (len(tweets), avg_score, top_tweet, has_notable)
+        self._twitter_cache[ticker.upper()] = (time.time(), result)
+        return result
 
     # ── Nitter fallback ────────────────────────────────────────────────────────
 
@@ -323,10 +345,31 @@ class SentimentAnalyzer:
     async def _search_news(self, token_name: str, ticker: str) -> tuple[int, float, str]:
         """
         Search NewsAPI for recent articles.
-        ⚠️  FREE TIER: 100 requests/day. Articles from past 30 days only.
+        Cache results per ticker for 12 hours to stay within 100 req/day limit.
+        If rate limited, stop calling until next day reset.
         """
         if not config.has_news:
             return 0, 0.0, ""
+
+        now = time.time()
+
+        # If we know we are rate limited, do not even try
+        if now < self._newsapi_blocked_until:
+            logger.debug("[Sentiment] NewsAPI blocked until reset — using cache only")
+            cached = self._news_cache.get(ticker)
+            if cached:
+                _, result = cached
+                return result
+            return 0, 0.0, ""
+
+        # Check cache — 12 hour TTL
+        cache_key = ticker.upper()
+        cached = self._news_cache.get(cache_key)
+        if cached:
+            cached_at, result = cached
+            if now - cached_at < 43200:  # 12 hours
+                logger.debug(f"[Sentiment] NewsAPI cache hit for {ticker}")
+                return result
 
         session = await self._get_session()
         params = {
@@ -346,19 +389,39 @@ class SentimentAnalyzer:
                     data = await resp.json(content_type=None)
                     articles = data.get("articles", [])
                     if not articles:
-                        return 0, 0.0, ""
+                        result = (0, 0.0, "")
+                        self._news_cache[cache_key] = (now, result)
+                        return result
                     texts = [
                         f"{a.get('title', '')} {a.get('description', '')}"
                         for a in articles
                     ]
                     avg_score, _ = self._score_texts(texts)
-                    # Build a quick summary from top article title
                     top = articles[0].get("title", "") if articles else ""
-                    summary = f"{len(articles)} news articles — top: \"{top[:80]}\"" if top else f"{len(articles)} articles"
+                    summary = (
+                        f"{len(articles)} news articles — top: \"{top[:80]}\""
+                        if top else f"{len(articles)} articles"
+                    )
                     logger.debug(f"[Sentiment] NewsAPI → {len(articles)} articles")
-                    return len(articles), avg_score, summary
+                    result = (len(articles), avg_score, summary)
+                    self._news_cache[cache_key] = (now, result)
+                    return result
                 elif resp.status == 429:
-                    logger.warning("[Sentiment] NewsAPI rate limited (100 req/day exceeded)")
+                    # Rate limited — block until midnight UTC
+                    import datetime
+                    tomorrow = datetime.datetime.utcnow().replace(
+                        hour=0, minute=5, second=0, microsecond=0
+                    ) + datetime.timedelta(days=1)
+                    self._newsapi_blocked_until = tomorrow.timestamp()
+                    logger.warning(
+                        f"[Sentiment] NewsAPI rate limit hit — "
+                        f"pausing until midnight UTC reset"
+                    )
+                    # Return cached result if available
+                    cached = self._news_cache.get(cache_key)
+                    if cached:
+                        _, result = cached
+                        return result
                 else:
                     logger.debug(f"[Sentiment] NewsAPI returned {resp.status}")
                 return 0, 0.0, ""
