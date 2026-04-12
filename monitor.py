@@ -24,9 +24,11 @@ MANUAL ALERTS (SELL button sent to Telegram):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 import aiohttp
@@ -48,6 +50,12 @@ def _get_executor():
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 HELIUS_BASE      = "https://api.helius.xyz/v0"
+
+# Persistence
+POSITIONS_FILE = os.environ.get(
+    "POSITIONS_FILE",
+    "/data/positions.json" if os.path.isdir("/data") else "positions.json"
+)
 
 # Alert type constants
 ALERT_STOP_LOSS        = "stop_loss"
@@ -129,6 +137,7 @@ class PositionMonitor:
         self._sentiment  = sentiment_analyzer
         self._session:   Optional[aiohttp.ClientSession] = None
         self._alert_callbacks: list = []
+        self._load_positions()
 
     # ── Session ───────────────────────────────────────────────────────────────
 
@@ -155,6 +164,7 @@ class PositionMonitor:
         if position.last_liquidity == 0.0:
             position.last_liquidity = position.liquidity_at_buy
         self.positions[position.mint] = position
+        self._save_positions()
         logger.info(
             f"[Monitor] Tracking {position.symbol} — "
             f"buy ${position.buy_price_usd:.8f}, "
@@ -165,6 +175,7 @@ class PositionMonitor:
     def remove_position(self, mint: str):
         if mint in self.positions:
             p = self.positions.pop(mint)
+            self._save_positions()
             logger.info(f"[Monitor] Removed position: {p.symbol}")
 
     def has_position(self, mint: str) -> bool:
@@ -175,6 +186,46 @@ class PositionMonitor:
 
     def list_positions(self) -> list[Position]:
         return list(self.positions.values())
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _save_positions(self):
+        """Save all open positions to disk. Called after every change."""
+        try:
+            data = {mint: asdict(pos) for mint, pos in self.positions.items()}
+            tmp = POSITIONS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, POSITIONS_FILE)
+            logger.debug(f"[Monitor] Saved {len(data)} positions to disk")
+        except Exception as e:
+            logger.error(f"[Monitor] Failed to save positions: {e}")
+
+    def _load_positions(self):
+        """Load positions from disk on startup — survives Railway restarts."""
+        if not os.path.exists(POSITIONS_FILE):
+            logger.info("[Monitor] No positions file — starting fresh")
+            return
+        try:
+            with open(POSITIONS_FILE) as f:
+                data = json.load(f)
+            loaded = 0
+            for mint, pos_dict in data.items():
+                try:
+                    pos = Position(**pos_dict)
+                    self.positions[mint] = pos
+                    loaded += 1
+                    logger.info(
+                        f"[Monitor] Restored: {pos.symbol} "
+                        f"({pos.tokens_remaining:,.0f} tokens remaining)"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Monitor] Could not restore {mint[:8]}: {e}")
+            if loaded:
+                logger.info(f"[Monitor] {loaded} position(s) restored from disk")
+        except Exception as e:
+            logger.error(f"[Monitor] Failed to load positions: {e}")
+
 
     # ── Price / liquidity / volume fetch ──────────────────────────────────────
 
@@ -290,6 +341,7 @@ class PositionMonitor:
         result = await executor.sell_token(pos.mint, tokens)
         if result.success:
             pos.tokens_remaining -= tokens
+            self._save_positions()
             logger.info(
                 f"[Monitor] Auto-sell OK: {pos.symbol} — {reason} — "
                 f"{tokens:,.0f} tokens → {result.output_amount:.4f} SOL"
