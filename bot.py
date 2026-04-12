@@ -29,12 +29,14 @@ from telegram.ext import (
     ContextTypes,
 )
 
+import os
 from config import config
 from executor import TradeExecutor
 from monitor import MonitorAlert, Position, PositionMonitor
 from safety import SafetyChecker
 from scout import TokenOpportunity, TokenScout
 from sentiment import SentimentAnalyzer
+from wallet_tracker import WalletTracker, WalletBuyAlert
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -56,6 +58,7 @@ safety_checker = SafetyChecker()
 sentiment_analyzer = SentimentAnalyzer()
 executor = TradeExecutor()
 monitor = PositionMonitor(sentiment_analyzer)
+wallet_tracker = WalletTracker()
 
 # ── Auth guard ────────────────────────────────────────────────────────────────
 
@@ -312,6 +315,39 @@ async def _on_risk_alert(alert: MonitorAlert, app: Application):
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 
+
+async def _on_wallet_alert(alert: "WalletBuyAlert", app):
+    chat_id = app.bot_data.get("chat_id", config.TELEGRAM_ALLOWED_USER_ID)
+    if not chat_id:
+        return
+    try:
+        safety_result = await safety_checker.full_safety_check(alert.token_mint, "", "")
+        safety_icon = "OK" if safety_result.passed else "FAIL"
+        text = (
+            "<b>WALLET ALERT</b>\n"
+            + ("=" * 28) + "\n"
+            + f"Wallet: <b>{html.escape(alert.wallet_name)}</b>\n"
+            + f"Bought: <b>${html.escape(alert.token_symbol)}</b>\n"
+            + f"Spent: <b>{alert.sol_spent:.3f} SOL</b>\n"
+            + f"CA: <code>{alert.token_mint}</code>\n\n"
+            + f"Safety: {safety_icon}\n"
+            + f"<pre>{html.escape(safety_result.detail[:300])}</pre>\n\n"
+            + f'<a href="https://solscan.io/tx/{alert.tx_signature}">View tx</a> | '
+            + f'<a href="https://dexscreener.com/solana/{alert.token_mint}">DexScreener</a>'
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("BUY", callback_data=f"WALLETBUY_{alert.token_mint}"),
+            InlineKeyboardButton("SKIP", callback_data=f"SKIP_{alert.token_mint}"),
+        ]])
+        await app.bot.send_message(
+            chat_id=chat_id, text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"[Bot] Wallet alert error: {e}")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         return await _unauthorized(update, context)
@@ -414,6 +450,58 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⏹️ Auto-scan stopped. Use /scan for manual scans."
     )
 
+
+
+async def cmd_addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update): return await _unauthorized(update, context)
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text("Usage: /addwallet [address] [name]")
+        return
+    address = args[0]
+    name = " ".join(args[1:])
+    if len(address) < 32:
+        await update.message.reply_text("Invalid Solana address.")
+        return
+    added = wallet_tracker.add_wallet(address, name)
+    if added:
+        public_url = os.environ.get("RAILWAY_PUBLIC_URL", "")
+        if public_url:
+            await wallet_tracker.register_webhook(public_url)
+        await update.message.reply_text(
+            f"Now tracking <b>{html.escape(name)}</b>\n<code>{address}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text("Already tracking that wallet.")
+
+
+async def cmd_removewallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update): return await _unauthorized(update, context)
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /removewallet [address]")
+        return
+    removed = wallet_tracker.remove_wallet(args[0])
+    if removed:
+        public_url = os.environ.get("RAILWAY_PUBLIC_URL", "")
+        if public_url:
+            await wallet_tracker.register_webhook(public_url)
+        await update.message.reply_text(f"Removed <b>{html.escape(removed.name)}</b>", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text("Wallet not found.")
+
+
+async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update): return await _unauthorized(update, context)
+    wallets = wallet_tracker.list_wallets()
+    if not wallets:
+        await update.message.reply_text("No wallets tracked yet. Use /addwallet [address] [name]")
+        return
+    lines = ["<b>Tracked Wallets</b>\n"]
+    for w in wallets:
+        lines.append(f"- <b>{html.escape(w.name)}</b>\n  <code>{w.address}</code>  (buys: {w.buy_count})")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
@@ -790,6 +878,13 @@ def main():
     monitor.register_alert_callback(
         lambda alert: _on_risk_alert(alert, app)
     )
+    wallet_tracker.register_alert_callback(lambda alert: _on_wallet_alert(alert, app))
+    port = int(os.environ.get("PORT", 8080))
+    public_url = os.environ.get("RAILWAY_PUBLIC_URL", "")
+    import asyncio as _aio
+    _aio.get_event_loop().run_until_complete(wallet_tracker.start_web_server(port))
+    if public_url and wallet_tracker.wallets:
+        _aio.get_event_loop().run_until_complete(wallet_tracker.register_webhook(public_url))
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
@@ -798,6 +893,9 @@ def main():
     app.add_handler(CommandHandler("positions", cmd_positions))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("addwallet", cmd_addwallet))
+    app.add_handler(CommandHandler("removewallet", cmd_removewallet))
+    app.add_handler(CommandHandler("wallets", cmd_wallets))
 
     # Inline keyboard callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
