@@ -875,6 +875,27 @@ def main():
     )
 
     # Register alert callback (needs reference to app for outbound messages)
+    # Register bot commands with Telegram so they appear in the menu
+    async def _register_commands():
+        await app.bot.set_my_commands([
+            ("start",        "Show bot status"),
+            ("scan",         "Manual scan now"),
+            ("positions",    "Open positions"),
+            ("balance",      "SOL wallet balance"),
+            ("wallets",      "List tracked wallets"),
+            ("addwallet",    "Add wallet to track"),
+            ("removewallet", "Remove tracked wallet"),
+            ("stop",         "Pause auto-scanning"),
+            ("help",         "All commands"),
+        ])
+
+    import asyncio as _aio2
+    try:
+        _aio2.get_event_loop().run_until_complete(_register_commands())
+        logger.info("[Bot] Commands registered with Telegram")
+    except Exception as e:
+        logger.warning(f"[Bot] Command registration failed: {e}")
+
     monitor.register_alert_callback(
         lambda alert: _on_risk_alert(alert, app)
     )
