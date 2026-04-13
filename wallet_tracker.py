@@ -98,17 +98,55 @@ class WalletTracker:
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def _save_wallets(self):
+        """
+        Save wallets to file AND print as env-var format so you can
+        copy it into Railway variables for true persistence across deploys.
+        """
         try:
             data = {addr: asdict(w) for addr, w in self.wallets.items()}
-            tmp = WALLETS_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, WALLETS_FILE)
-            logger.debug(f"[WalletTracker] Saved {len(data)} wallets")
+            # Save to file (works locally, lost on Railway redeploy)
+            try:
+                tmp = WALLETS_FILE + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, WALLETS_FILE)
+            except Exception:
+                pass
+            # Also save to env var format for Railway persistence
+            env_val = json.dumps(data)
+            logger.info(
+                f"[WalletTracker] Saved {len(data)} wallets. "
+                f"To persist across redeploys, set Railway variable:\n"
+                f"TRACKED_WALLETS={env_val}"
+            )
         except Exception as e:
             logger.error(f"[WalletTracker] Failed to save wallets: {e}")
 
     def _load_wallets(self):
+        """
+        Load wallets from TRACKED_WALLETS env var first (Railway persistent),
+        then fall back to local file.
+        """
+        # Priority 1: TRACKED_WALLETS Railway variable
+        env_data = os.environ.get("TRACKED_WALLETS", "")
+        if env_data:
+            try:
+                data = json.loads(env_data)
+                for addr, w_dict in data.items():
+                    try:
+                        self.wallets[addr] = TrackedWallet(**w_dict)
+                    except Exception as e:
+                        logger.warning(f"[WalletTracker] Could not load wallet {addr}: {e}")
+                if self.wallets:
+                    logger.info(
+                        f"[WalletTracker] Loaded {len(self.wallets)} wallets "
+                        f"from TRACKED_WALLETS env var"
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"[WalletTracker] Could not parse TRACKED_WALLETS: {e}")
+
+        # Priority 2: Local file
         if not os.path.exists(WALLETS_FILE):
             logger.info("[WalletTracker] No wallets file — starting fresh")
             return
@@ -121,7 +159,7 @@ class WalletTracker:
                 except Exception as e:
                     logger.warning(f"[WalletTracker] Could not load wallet {addr}: {e}")
             logger.info(
-                f"[WalletTracker] Loaded {len(self.wallets)} tracked wallets"
+                f"[WalletTracker] Loaded {len(self.wallets)} wallets from file"
             )
         except Exception as e:
             logger.error(f"[WalletTracker] Failed to load wallets: {e}")

@@ -185,6 +185,9 @@ class TokenScout:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._seen_mints: dict[str, float] = {}  # mint -> last_alerted timestamp
+        self._scan_count: int = 0               # stagger GeckoTerminal calls
+        self._seen_tickers: dict[str, str] = {} # ticker -> first CA seen
+        self._load_seen_mints()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
