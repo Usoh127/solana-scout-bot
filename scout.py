@@ -13,7 +13,9 @@ dropped — it never reaches the sentiment or briefing layers.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,6 +51,12 @@ HEADERS_BIRDEYE = {
     "X-API-KEY": config.BIRDEYE_API_KEY,
     "x-chain": "solana",
 }
+
+# Persist seen mints so cooldown survives Railway restarts
+SEEN_MINTS_FILE = os.environ.get(
+    "SEEN_MINTS_FILE",
+    "/data/seen_mints.json" if os.path.isdir("/data") else "seen_mints.json"
+)
 
 # ─── Data model ───────────────────────────────────────────────────────────────
 
@@ -96,6 +104,10 @@ class TokenOpportunity:
     # data-only flag: set when chart is strong but social signal is weak
     data_only_call: bool = False
     data_only_reason: str = ""
+
+    # Copycat detection
+    possible_copycat: bool = False
+    original_ca: str = ""
 
     # internal: track when we first saw this token so we don't re-alert
     first_seen: float = field(default_factory=time.time)
@@ -173,7 +185,6 @@ class TokenScout:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._seen_mints: dict[str, float] = {}  # mint -> last_alerted timestamp
-        self._scan_count: int = 0  # used to stagger GeckoTerminal calls
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -453,6 +464,41 @@ class TokenScout:
 
     def mark_alerted(self, mint: str):
         self._seen_mints[mint] = time.time()
+        self._save_seen_mints()
+
+    def _save_seen_mints(self):
+        try:
+            # Only save mints that are still within cooldown window
+            now = time.time()
+            active = {
+                m: t for m, t in self._seen_mints.items()
+                if now - t < config.ALERT_COOLDOWN_HOURS * 3600
+            }
+            tmp = SEEN_MINTS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(active, f)
+            os.replace(tmp, SEEN_MINTS_FILE)
+        except Exception as e:
+            logger.debug(f"[Scout] Could not save seen mints: {e}")
+
+    def _load_seen_mints(self):
+        if not os.path.exists(SEEN_MINTS_FILE):
+            return
+        try:
+            with open(SEEN_MINTS_FILE) as f:
+                data = json.load(f)
+            now = time.time()
+            # Only load mints still within cooldown
+            self._seen_mints = {
+                m: t for m, t in data.items()
+                if now - t < config.ALERT_COOLDOWN_HOURS * 3600
+            }
+            if self._seen_mints:
+                logger.info(
+                    f"[Scout] Loaded {len(self._seen_mints)} cooldown mints from disk"
+                )
+        except Exception as e:
+            logger.debug(f"[Scout] Could not load seen mints: {e}")
 
     # ── Dedup ──────────────────────────────────────────────────────────────────
 
@@ -476,29 +522,16 @@ class TokenScout:
         Full scan cycle. Returns list of TokenOpportunity objects that have
         passed ALL configured thresholds and are not on cooldown.
         """
-        self._scan_count += 1
-        logger.info(f"[Scout] Starting scan cycle {self._scan_count}…")
+        logger.info("[Scout] Starting scan cycle…")
 
-        # GeckoTerminal: only every 2nd scan to avoid rate limiting
-        # DexScreener: every scan (no rate limits)
-        # Birdeye: every scan if key available
-        run_gecko = (self._scan_count % 2 == 1)
+        # Gather from all sources in parallel
+        gecko_task = asyncio.create_task(self._fetch_gecko_new_pools())
+        dex_task = asyncio.create_task(self._fetch_dexscreener_trending())
+        bird_task = asyncio.create_task(self._fetch_birdeye_trending())
 
-        if run_gecko:
-            gecko_task = asyncio.create_task(self._fetch_gecko_new_pools())
-            dex_task   = asyncio.create_task(self._fetch_dexscreener_trending())
-            bird_task  = asyncio.create_task(self._fetch_birdeye_trending())
-            gecko_results, dex_results, bird_results = await asyncio.gather(
-                gecko_task, dex_task, bird_task, return_exceptions=True
-            )
-        else:
-            logger.debug("[Scout] Skipping GeckoTerminal this cycle (rate limit protection)")
-            dex_task  = asyncio.create_task(self._fetch_dexscreener_trending())
-            bird_task = asyncio.create_task(self._fetch_birdeye_trending())
-            dex_results, bird_results = await asyncio.gather(
-                dex_task, bird_task, return_exceptions=True
-            )
-            gecko_results = []
+        gecko_results, dex_results, bird_results = await asyncio.gather(
+            gecko_task, dex_task, bird_task, return_exceptions=True
+        )
 
         raw: list[dict] = []
         for result in [gecko_results, dex_results, bird_results]:
@@ -521,6 +554,20 @@ class TokenScout:
                 logger.debug(f"[Scout] {t.get('symbol')} dropped: {reason}")
                 continue
 
+            # Check for duplicate ticker (copycat token warning)
+            ticker_upper = t["symbol"].upper()
+            if ticker_upper in self._seen_tickers and self._seen_tickers[ticker_upper] != mint:
+                logger.info(
+                    f"[Scout] Duplicate ticker ${ticker_upper}: "
+                    f"first CA={self._seen_tickers[ticker_upper][:8]}, "
+                    f"this CA={mint[:8]} — flagging as copycat"
+                )
+                # Still surface it but mark as possible copycat
+                t["possible_copycat"] = True
+                t["original_ca"] = self._seen_tickers[ticker_upper]
+            else:
+                self._seen_tickers[ticker_upper] = mint
+
             opp = TokenOpportunity(
                 mint=mint,
                 name=t["name"],
@@ -539,6 +586,8 @@ class TokenScout:
                 price_change_24h=t["price_change_24h"],
                 launched_at=t.get("launched_at"),
                 age_hours=t["age_hours"],
+                possible_copycat=t.get("possible_copycat", False),
+                original_ca=t.get("original_ca", ""),
             )
             opportunities.append(opp)
 

@@ -184,6 +184,16 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
             f"<i>Reason: {html.escape(opp.data_only_reason)}</i>\n"
         )
 
+    # Copycat warning block
+    copycat_block = ""
+    if hasattr(opp, "possible_copycat") and opp.possible_copycat:
+        orig = opp.original_ca if hasattr(opp, "original_ca") else "unknown"
+        copycat_block = (
+            f"\n⚠️ <b>POSSIBLE COPYCAT TOKEN</b>\n"
+            f"<i>Another token with ticker ${html.escape(opp.symbol)} exists:\n"
+            f"<code>{orig}</code></i>\n"
+        )
+
     # Shorten mint for display
     short_mint = f"{opp.mint[:6]}...{opp.mint[-4:]}"
 
@@ -238,7 +248,8 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"{reddit_block}"
         f"{html.escape(opp.sentiment_summary)}\n"
         f"{news_block}"
-        f"{data_only_block}\n"
+        f"{data_only_block}"
+        f"{copycat_block}\n"
         f"{conf_emoji} <b>Confidence: {opp.confidence}/10</b>\n"
         f"<i>{html.escape(opp.confidence_rationale)}</i>\n\n"
         f"{'━' * 28}\n"
