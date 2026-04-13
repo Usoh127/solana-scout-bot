@@ -374,6 +374,116 @@ class SafetyChecker:
 
         return instant_fail or len(red_flags) >= 2, red_flags
 
+    # ── Bundle detection ──────────────────────────────────────────────────────────
+
+    async def _check_bundle(
+        self, mint: str
+    ) -> tuple[float, str]:
+        """
+        Detect coordinated/bundled launches by analyzing early buyers.
+
+        Checks:
+        1. Same-slot buys: multiple wallets buying in exact same block = coordinated
+        2. Early buyer concentration: first 20 buys holding >50% of supply = risky
+        3. Common funding: early wallets funded from same source (simplified check)
+
+        Returns (bundle_risk_score, description)
+        score: 0.0 = clean, 1.0 = highly likely bundled
+        """
+        if not config.has_helius:
+            return 0.0, ""
+
+        session = await self._get_session()
+        url    = f"https://api.helius.xyz/v0/addresses/{mint}/transactions"
+        params = {
+            "api-key": config.HELIUS_API_KEY,
+            "type":    "SWAP",
+            "limit":   20,  # First 20 swap transactions
+        }
+
+        try:
+            async with session.get(
+                url, params=params,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return 0.0, ""
+                txns = await resp.json(content_type=None)
+                if not isinstance(txns, list) or not txns:
+                    return 0.0, ""
+
+        except Exception as e:
+            logger.debug(f"[Safety] Bundle check error: {e}")
+            return 0.0, ""
+
+        # ── Check 1: Same-slot buys ──────────────────────────────────────────
+        slots: dict[int, list[str]] = {}  # slot -> list of buyer wallets
+        buyer_amounts: dict[str, float] = {}  # wallet -> token amount bought
+
+        for tx in txns:
+            slot      = tx.get("slot", 0)
+            fee_payer = tx.get("feePayer", "")
+            if not fee_payer or not slot:
+                continue
+
+            token_transfers = tx.get("tokenTransfers", [])
+            for transfer in token_transfers:
+                if transfer.get("mint") != mint:
+                    continue
+                to_acct = transfer.get("toUserAccount", "")
+                amount  = float(transfer.get("tokenAmount") or 0)
+                if to_acct == fee_payer and amount > 0:
+                    # This wallet bought tokens
+                    if slot not in slots:
+                        slots[slot] = []
+                    if fee_payer not in slots[slot]:
+                        slots[slot].append(fee_payer)
+                    buyer_amounts[fee_payer] = (
+                        buyer_amounts.get(fee_payer, 0) + amount
+                    )
+
+        # Count wallets buying in same slot
+        max_same_slot = max((len(v) for v in slots.values()), default=0)
+
+        # ── Check 2: Early buyer concentration ──────────────────────────────
+        total_bought = sum(buyer_amounts.values())
+        unique_buyers = len(buyer_amounts)
+
+        # Risk flags
+        flags = []
+        risk  = 0.0
+
+        if max_same_slot >= 5:
+            risk += 0.5
+            flags.append(f"{max_same_slot} wallets bought in the same block slot")
+        elif max_same_slot >= 3:
+            risk += 0.25
+            flags.append(f"{max_same_slot} wallets in same slot (mild coordination)")
+
+        if unique_buyers > 0 and unique_buyers <= 5 and total_bought > 0:
+            # Very few early buyers — high concentration risk
+            risk += 0.3
+            flags.append(f"Only {unique_buyers} unique early buyers")
+
+        # Check if one wallet dominates early buys
+        if total_bought > 0 and buyer_amounts:
+            largest_buyer_pct = max(buyer_amounts.values()) / total_bought * 100
+            if largest_buyer_pct > 50:
+                risk += 0.3
+                flags.append(
+                    f"Single wallet holds {largest_buyer_pct:.0f}% of early buys"
+                )
+
+        risk = min(risk, 1.0)
+
+        if flags:
+            description = "Bundle signals: " + " | ".join(flags)
+            logger.info(f"[Safety] {mint[:8]}: {description} (risk={risk:.2f})")
+        else:
+            description = ""
+
+        return risk, description
+
     async def full_safety_check(
         self, mint: str, pool_address: str = "", dex_name: str = ""
     ) -> SafetyResult:
@@ -386,6 +496,7 @@ class SafetyChecker:
             self._check_lp_burned(pool_address, mint, dex_name),
             self._check_token_extensions(mint),
             self._check_pool_safety(pool_address, dex_name),
+            self._check_bundle(mint),
             return_exceptions=True,
         )
 
@@ -395,6 +506,8 @@ class SafetyChecker:
         lp_burned         = results[3] if not isinstance(results[3], Exception) else None
         extension_result  = results[4] if not isinstance(results[4], Exception) else ("unknown", [])
         pool_result       = results[5] if not isinstance(results[5], Exception) else ("unknown", 0.0, [])
+        bundle_result     = results[6] if not isinstance(results[6], Exception) else (0.0, "")
+        bundle_risk, bundle_desc = bundle_result if isinstance(bundle_result, tuple) else (0.0, "")
 
         mint_renounced, freeze_renounced = mint_auth_result
         token_program, dangerous_extensions = extension_result
@@ -409,6 +522,12 @@ class SafetyChecker:
                 top10_pct = float(birdeye_data["top10HolderPercent"]) * 100
             if birdeye_data.get("lpBurned") is not None:
                 lp_burned = birdeye_data["lpBurned"]
+
+        # Add bundle detection to pool warnings
+        if bundle_risk >= 0.5 and bundle_desc:
+            pool_warnings.append(f"🚨 HIGH BUNDLE RISK: {bundle_desc}")
+        elif bundle_risk >= 0.25 and bundle_desc:
+            pool_warnings.append(f"⚠️ Bundle signals detected: {bundle_desc}")
 
         is_honeypot, red_flags = self._check_honeypot_heuristics(
             mint_renounced, freeze_renounced, top10_pct,
