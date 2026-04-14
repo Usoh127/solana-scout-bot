@@ -182,6 +182,125 @@ def _get_buy_amount(confidence: int) -> float:
         return base
 
 
+def _assess_entry_quality(opp: TokenOpportunity) -> tuple[str, str, str]:
+    """
+    Assess whether this is a good entry point or chasing the top.
+
+    Returns (grade, label, explanation)
+    Grade: A / B / C / D
+    A = Strong entry opportunity
+    B = Decent entry, some caution
+    C = Late / extended, high risk entry
+    D = Very extended or suspicious, avoid chasing
+    """
+    p1h  = opp.price_change_1h   # % change last 1h
+    p6h  = opp.price_change_6h   # % change last 6h
+    p24h = opp.price_change_24h  # % change last 24h
+    age  = opp.age_hours
+    liq  = opp.liquidity_usd
+    vol  = opp.volume_24h_usd
+    vol1h = opp.volume_1h_usd
+
+    score  = 0   # higher = better entry
+    notes  = []
+
+    # ── Age assessment ────────────────────────────────────────────────────────
+    if age < (5 / 60):   # under 5 min
+        score -= 2
+        notes.append("under 5min old — too early, high rug risk")
+    elif age < 0.5:      # 5-30 min
+        score += 2
+        notes.append("early stage (5-30min)")
+    elif age < 2:        # 30min - 2h
+        score += 1
+        notes.append("young token (30min-2h)")
+    else:                # over 2h
+        score -= 1
+        notes.append("older token (2h+)")
+
+    # ── Price velocity: is the pump fresh or extended? ────────────────────────
+    if p1h > 0 and p6h > 0:
+        # Ratio of recent vs earlier momentum
+        # If 1h move is much smaller than 6h move → momentum slowing
+        # If 1h move ≈ 6h move → it all happened in 1h (vertical spike)
+        recent_vs_total = p1h / p6h if p6h > 0 else 1.0
+
+        if p1h >= 500:
+            score -= 3
+            notes.append(f"500%+ in 1h — very extended, likely chasing")
+        elif p1h >= 200:
+            score -= 2
+            notes.append(f"200%+ in 1h — extended, risky entry")
+        elif p1h >= 100:
+            score -= 1
+            notes.append(f"100%+ in 1h — extended but possible")
+        elif p1h >= 30:
+            score += 1
+            notes.append(f"healthy 1h momentum ({p1h:.0f}%)")
+        elif p1h >= 10:
+            score += 2
+            notes.append(f"steady momentum ({p1h:.0f}% 1h) — good entry zone")
+
+        # Check if token already did most of its move earlier (fading)
+        if p6h > 0 and p1h < p6h * 0.1 and p6h > 50:
+            score -= 2
+            notes.append("momentum fading — most of move already happened")
+
+    # ── Pullback from high (dip entry) ────────────────────────────────────────
+    # If 6h >> 1h and 1h is still positive, could be recovering dip
+    if p6h > 50 and 5 < p1h < 50:
+        score += 1
+        notes.append("recovering from earlier pump — possible dip entry")
+
+    # ── Volume quality ────────────────────────────────────────────────────────
+    if liq > 0:
+        vol_liq_ratio = vol / liq
+        if vol_liq_ratio >= 5:
+            score += 2
+            notes.append("strong vol/liq ratio")
+        elif vol_liq_ratio >= 2:
+            score += 1
+            notes.append("solid volume")
+        elif vol_liq_ratio < 0.5:
+            score -= 1
+            notes.append("weak volume for liquidity size")
+
+    # ── Recent 1h volume vs overall ───────────────────────────────────────────
+    if vol > 0 and vol1h > 0:
+        recent_vol_pct = (vol1h / vol) * 100
+        if recent_vol_pct >= 40:
+            score += 1
+            notes.append(f"{recent_vol_pct:.0f}% of volume in last 1h — active")
+        elif recent_vol_pct < 10 and vol > 100_000:
+            score -= 1
+            notes.append("volume drying up in last hour")
+
+    # ── Market cap sanity ──────────────────────────────────────────────────────
+    mcap = opp.market_cap_usd
+    if mcap > 500_000:
+        score -= 2
+        notes.append(f"mcap ${mcap/1000:.0f}K — limited upside from here")
+    elif mcap > 200_000:
+        score -= 1
+        notes.append(f"mcap ${mcap/1000:.0f}K — moderate upside")
+    elif mcap < 100_000:
+        score += 1
+        notes.append(f"mcap ${mcap/1000:.0f}K — good room to grow")
+
+    # ── Assign grade ──────────────────────────────────────────────────────────
+    top_notes = notes[:3]
+    explanation = " · ".join(top_notes)
+
+    if score >= 4:
+        return "A", "Strong entry", explanation
+    elif score >= 2:
+        return "B", "Decent entry", explanation
+    elif score >= 0:
+        return "C", "Caution — extended", explanation
+    else:
+        return "D", "Avoid chasing", explanation
+
+
 def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
     """Build the formatted Telegram briefing message + action buttons."""
 
@@ -244,6 +363,16 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
             opp.launched_at.strftime("%b %d %H:%M UTC") + f" ({opp.age_str})"
         )
 
+    # Entry quality assessment
+    entry_grade, entry_label, entry_explanation = _assess_entry_quality(opp)
+    entry_emoji = {
+        "A": "🟢", "B": "🔵", "C": "🟡", "D": "🔴"
+    }.get(entry_grade, "⚪")
+    entry_block = (
+        f"{entry_emoji} <b>Entry Quality: {entry_grade} — {entry_label}</b>\n"
+        f"<i>{html.escape(entry_explanation)}</i>\n\n"
+    )
+
     text = (
         f"🔎 <b>NEW RUNNER ALERT</b>\n"
         f"{'━' * 28}\n"
@@ -270,6 +399,7 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"{copycat_block}\n"
         f"{conf_emoji} <b>Confidence: {opp.confidence}/10</b>\n"
         f"<i>{html.escape(opp.confidence_rationale)}</i>\n\n"
+        f"{entry_block}"
         f"{'━' * 28}\n"
         f"💸 Buy size: <b>{_get_buy_amount(opp.confidence)} SOL</b>"
         f"  ({int(_get_buy_amount(opp.confidence)/config.BUY_AMOUNT_SOL*100)}% of max)"
