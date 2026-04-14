@@ -164,6 +164,24 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
     return score, rationale
 
 
+def _get_buy_amount(confidence: int) -> float:
+    """
+    Scale buy size to confidence score.
+    Low confidence = small position. High confidence = full position.
+
+    5/10 or below  → 50% of configured buy size (cautious)
+    6-7/10         → 75% of configured buy size
+    8-10/10        → 100% of configured buy size (full conviction)
+    """
+    base = config.BUY_AMOUNT_SOL
+    if confidence <= 5:
+        return round(base * 0.5, 4)
+    elif confidence <= 7:
+        return round(base * 0.75, 4)
+    else:
+        return base
+
+
 def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
     """Build the formatted Telegram briefing message + action buttons."""
 
@@ -253,7 +271,9 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"{conf_emoji} <b>Confidence: {opp.confidence}/10</b>\n"
         f"<i>{html.escape(opp.confidence_rationale)}</i>\n\n"
         f"{'━' * 28}\n"
-        f"💸 Buy size: <b>{config.BUY_AMOUNT_SOL} SOL</b>  · Slippage: {config.SLIPPAGE_BPS / 100:.1f}%"
+        f"💸 Buy size: <b>{_get_buy_amount(opp.confidence)} SOL</b>"
+        f"  ({int(_get_buy_amount(opp.confidence)/config.BUY_AMOUNT_SOL*100)}% of max)"
+        f"  · Slippage: {config.SLIPPAGE_BPS / 100:.1f}%"
     )
 
     keyboard = InlineKeyboardMarkup(
@@ -726,7 +746,8 @@ async def _handle_buy_intent(query, context, mint: str):
         f"Ticker: <b>${html.escape(opp.symbol)}</b>\n"
         f"CA:     <code>{opp.mint}</code>\n"
         f"DEX:    {html.escape(opp.dex.title())}\n\n"
-        f"Amount: <b>{config.BUY_AMOUNT_SOL} SOL</b>\n"
+        f"Amount: <b>{_get_buy_amount(opp.confidence if opp.confidence > 0 else 5)} SOL</b>"
+        f" ({int(_get_buy_amount(opp.confidence if opp.confidence > 0 else 5)/config.BUY_AMOUNT_SOL*100)}% of max)\n"
         f"Price:  <code>${opp.price_usd:.8f}</code>\n"
         f"Slippage: {config.SLIPPAGE_BPS / 100:.1f}%\n\n"
         f"<b>This action is irreversible. Confirm?</b>"
@@ -756,7 +777,8 @@ async def _handle_confirm_buy(query, context, mint: str):
         parse_mode=ParseMode.HTML,
     )
 
-    result = await executor.buy_token(mint)
+    buy_amount = _get_buy_amount(opp.confidence) if opp.confidence > 0 else config.BUY_AMOUNT_SOL
+    result = await executor.buy_token(mint, amount_sol=buy_amount)
 
     if result.success:
         tx_link = f"https://solscan.io/tx/{result.tx_hash}"
