@@ -378,7 +378,9 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"{'━' * 28}\n"
         f"🪙 <b>{html.escape(opp.name)}</b>  <code>${html.escape(opp.symbol)}</code>\n"
         f"📍 <code>{opp.mint}</code>\n"
-        f"🏊 DEX: {html.escape(opp.dex.title())}\n\n"
+        f"🏊 DEX: {html.escape(opp.dex.title())}"
+        + ("  📊 <b>DEX Enhanced Paid</b>" if hasattr(opp, "dex_paid") and opp.dex_paid else "")
+        + "\n\n"
         f"💰 <b>Financials</b>\n"
         f"  ├ Price:    <code>${opp.price_usd:.8f}</code>\n"
         f"  ├ MCap:     <b>{_fmt_usd(opp.market_cap_usd)}</b>\n"

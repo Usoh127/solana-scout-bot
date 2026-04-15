@@ -109,6 +109,9 @@ class TokenOpportunity:
     possible_copycat: bool = False
     original_ca: str = ""
 
+    # DexScreener Enhanced listing paid
+    dex_paid: bool = False
+
     # internal: track when we first saw this token so we don't re-alert
     first_seen: float = field(default_factory=time.time)
 
@@ -363,6 +366,17 @@ class TokenScout:
                 except Exception:
                     pass
 
+            # DexScreener Enhanced listing — dev paid for visibility boost
+            # Shows as "boosts" field or non-empty "info" with links/description
+            info     = pair.get("info") or {}
+            boosts   = pair.get("boosts") or {}
+            dex_paid = bool(
+                boosts.get("active", 0) > 0
+                or info.get("description")
+                or (info.get("socials") and len(info.get("socials", [])) > 0)
+                or (info.get("websites") and len(info.get("websites", [])) > 0)
+            )
+
             return {
                 "mint": mint,
                 "name": base.get("name", "Unknown"),
@@ -381,6 +395,7 @@ class TokenScout:
                 "price_change_24h": float(price_change.get("h24") or 0),
                 "launched_at": created_at,
                 "age_hours": age_hours,
+                "dex_paid": dex_paid,
             }
         except Exception as e:
             logger.debug(f"Error parsing DexScreener pair: {e}")
@@ -591,6 +606,7 @@ class TokenScout:
                 age_hours=t["age_hours"],
                 possible_copycat=t.get("possible_copycat", False),
                 original_ca=t.get("original_ca", ""),
+                dex_paid=t.get("dex_paid", False),
             )
             opportunities.append(opp)
 
