@@ -374,6 +374,80 @@ class SafetyChecker:
 
         return instant_fail or len(red_flags) >= 2, red_flags
 
+    # ── Fake volume detection ────────────────────────────────────────────────────
+
+    def _check_fake_volume(
+        self, volume_24h: float, liquidity: float, txns_24h: int
+    ) -> tuple[float, str]:
+        """
+        Detect fake/wash-traded volume using two signals validated by experienced traders:
+
+        Signal 1 — Volume/Liquidity ratio
+            Natural markets: vol/liq typically 2x-20x
+            Wash trading: vol/liq can be 100x+ (same SOL looping)
+            Guide reference: "If volume is extremely high but liquidity is low,
+            something is off. Natural markets cannot sustain heavy volume
+            without liquidity."
+
+        Signal 2 — Average trade size
+            Real organic trading = many small/medium trades
+            Wash trading = few huge trades OR bot-perfect identical sizes
+            We proxy this as: avg_trade = volume_24h / txns_24h
+            If avg trade > 5% of liquidity = suspicious (few large trades)
+
+        Returns (fake_vol_risk, description)
+        0.0 = clean, 1.0 = very likely fake
+        """
+        if volume_24h <= 0 or liquidity <= 0:
+            return 0.0, ""
+
+        flags = []
+        risk  = 0.0
+
+        # Signal 1: vol/liq ratio
+        vol_liq = volume_24h / liquidity
+        if vol_liq > 100:
+            risk += 0.6
+            flags.append(
+                f"vol/liq ratio {vol_liq:.0f}x — extreme (likely wash trading)"
+            )
+        elif vol_liq > 50:
+            risk += 0.3
+            flags.append(f"vol/liq ratio {vol_liq:.0f}x — suspicious")
+        elif vol_liq > 30:
+            risk += 0.1
+            flags.append(f"vol/liq ratio {vol_liq:.0f}x — elevated")
+
+        # Signal 2: average trade size vs liquidity
+        if txns_24h > 0:
+            avg_trade = volume_24h / txns_24h
+            avg_trade_pct = (avg_trade / liquidity) * 100
+            if avg_trade_pct > 20:
+                risk += 0.4
+                flags.append(
+                    f"avg trade is {avg_trade_pct:.0f}% of liquidity — "
+                    f"very few large trades (bot pattern)"
+                )
+            elif avg_trade_pct > 10:
+                risk += 0.2
+                flags.append(
+                    f"avg trade is {avg_trade_pct:.0f}% of liquidity — suspicious"
+                )
+        elif volume_24h > 50_000:
+            # High volume but zero transactions reported = data gap / likely fake
+            risk += 0.3
+            flags.append("high volume but no transaction count data")
+
+        risk = min(risk, 1.0)
+        description = " | ".join(flags) if flags else ""
+
+        if flags:
+            logger.info(
+                f"[Safety] Fake volume signals: {description} (risk={risk:.2f})"
+            )
+
+        return risk, description
+
     # ── Bundle detection ──────────────────────────────────────────────────────────
 
     async def _check_bundle(
@@ -485,9 +559,14 @@ class SafetyChecker:
         return risk, description
 
     async def full_safety_check(
-        self, mint: str, pool_address: str = "", dex_name: str = ""
+        self, mint: str, pool_address: str = "", dex_name: str = "",
+        volume_24h: float = 0.0, liquidity: float = 0.0, txns_24h: int = 0
     ) -> SafetyResult:
         logger.info(f"[Safety] Running checks for {mint}")
+        # Store passed-in market data for fake volume check
+        opp_volume_24h = volume_24h
+        opp_liquidity  = liquidity
+        opp_txns_24h   = txns_24h
 
         results = await asyncio.gather(
             self._check_birdeye_security(mint),
@@ -528,6 +607,15 @@ class SafetyChecker:
             pool_warnings.append(f"🚨 HIGH BUNDLE RISK: {bundle_desc}")
         elif bundle_risk >= 0.25 and bundle_desc:
             pool_warnings.append(f"⚠️ Bundle signals detected: {bundle_desc}")
+
+        # Fake volume check (synchronous — uses data already available)
+        fake_vol_risk, fake_vol_desc = self._check_fake_volume(
+            opp_volume_24h, opp_liquidity, opp_txns_24h
+        )
+        if fake_vol_risk >= 0.5 and fake_vol_desc:
+            pool_warnings.append(f"🚨 FAKE VOLUME LIKELY: {fake_vol_desc}")
+        elif fake_vol_risk >= 0.25 and fake_vol_desc:
+            pool_warnings.append(f"⚠️ Volume quality concern: {fake_vol_desc}")
 
         is_honeypot, red_flags = self._check_honeypot_heuristics(
             mint_renounced, freeze_renounced, top10_pct,

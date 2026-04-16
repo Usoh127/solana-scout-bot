@@ -112,6 +112,9 @@ class TokenOpportunity:
     # DexScreener Enhanced listing paid
     dex_paid: bool = False
 
+    # Transaction count (for fake volume detection)
+    txns_24h: int = 0
+
     # internal: track when we first saw this token so we don't re-alert
     first_seen: float = field(default_factory=time.time)
 
@@ -396,6 +399,10 @@ class TokenScout:
                 "launched_at": created_at,
                 "age_hours": age_hours,
                 "dex_paid": dex_paid,
+                "txns_24h": int(
+                    (pair.get("txns") or {}).get("h24", {}).get("buys", 0)
+                    + (pair.get("txns") or {}).get("h24", {}).get("sells", 0)
+                ),
             }
         except Exception as e:
             logger.debug(f"Error parsing DexScreener pair: {e}")
@@ -607,6 +614,7 @@ class TokenScout:
                 possible_copycat=t.get("possible_copycat", False),
                 original_ca=t.get("original_ca", ""),
                 dex_paid=t.get("dex_paid", False),
+                txns_24h=t.get("txns_24h", 0),
             )
             opportunities.append(opp)
 
