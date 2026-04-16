@@ -37,6 +37,7 @@ from safety import SafetyChecker
 from scout import TokenOpportunity, TokenScout
 from sentiment import SentimentAnalyzer
 from wallet_tracker import WalletTracker, WalletBuyAlert
+from narrative_tracker import narrative_tracker
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -379,6 +380,19 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"<i>🕐 Alert time: {_wat_str}</i>\n\n"
     )
 
+    # Narrative fit check
+    fits_narrative, narrative_fit_desc = narrative_tracker.get_token_narrative_fit(
+        opp.name, opp.symbol
+    )
+    narrative_section = narrative_tracker.state.format_for_alert()
+
+    # Narrative match bonus note
+    narrative_match_line = ""
+    if fits_narrative and narrative_fit_desc:
+        narrative_match_line = (
+            f"\n✅ <b>{html.escape(narrative_fit_desc)}</b>\n"
+        )
+
     text = (
         f"🔎 <b>NEW RUNNER ALERT</b>\n"
         f"{'━' * 28}\n"
@@ -409,7 +423,8 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"<i>{html.escape(opp.confidence_rationale)}</i>\n\n"
         f"{entry_block}"
         f"{'━' * 28}\n"
-        f"💸 Buy size: <b>{_get_buy_amount(opp.confidence)} SOL</b>"
+        + (f"{narrative_section}\n{'━' * 28}\n" if narrative_section else "")
+        + f"💸 Buy size: <b>{_get_buy_amount(opp.confidence)} SOL</b>"
         f"  ({int(_get_buy_amount(opp.confidence)/config.BUY_AMOUNT_SOL*100)}% of max)"
         f"  · Slippage: {config.SLIPPAGE_BPS / 100:.1f}%"
     )

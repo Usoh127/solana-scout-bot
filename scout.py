@@ -24,6 +24,7 @@ from typing import Optional
 import aiohttp
 
 from config import config
+from narrative_tracker import narrative_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -592,6 +593,11 @@ class TokenScout:
                 t["original_ca"] = self._seen_tickers[ticker_upper]
             else:
                 self._seen_tickers[ticker_upper] = mint
+
+            # Record for narrative detection
+            narrative_tracker.record_token(
+                t.get("name", ""), t.get("symbol", ""), passed=True
+            )
 
             opp = TokenOpportunity(
                 mint=mint,
