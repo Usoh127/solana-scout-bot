@@ -368,9 +368,15 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
     entry_emoji = {
         "A": "🟢", "B": "🔵", "C": "🟡", "D": "🔴"
     }.get(entry_grade, "⚪")
+    # Current WAT time for display
+    import datetime as _dt2
+    _wat_now = _dt2.datetime.utcnow() + _dt2.timedelta(hours=1)
+    _wat_str = _wat_now.strftime("%H:%M WAT")
+
     entry_block = (
         f"{entry_emoji} <b>Entry Quality: {entry_grade} — {entry_label}</b>\n"
-        f"<i>{html.escape(entry_explanation)}</i>\n\n"
+        f"<i>{html.escape(entry_explanation)}</i>\n"
+        f"<i>🕐 Alert time: {_wat_str}</i>\n\n"
     )
 
     text = (

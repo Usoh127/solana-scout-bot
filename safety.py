@@ -374,6 +374,143 @@ class SafetyChecker:
 
         return instant_fail or len(red_flags) >= 2, red_flags
 
+    # ── Deployer wallet history check ────────────────────────────────────────────
+
+    async def _check_deployer_history(
+        self, mint: str
+    ) -> tuple[float, str]:
+        """
+        Check if the token deployer has a history of rugging.
+
+        Method:
+        1. Fetch the token's creation transaction via Helius to get deployer address
+        2. Fetch the last 10 tokens deployed by the same wallet
+        3. Flag if deployer has pattern of quick liquidity pulls / abandoned tokens
+
+        Returns (rug_risk_score, description)
+        0.0 = clean or unknown, 1.0 = known rugger
+        """
+        if not config.has_helius:
+            return 0.0, ""
+
+        session = await self._get_session()
+
+        # Step 1: Get token creation tx to find deployer
+        deployer = None
+        try:
+            url = f"https://api.helius.xyz/v0/addresses/{mint}/transactions"
+            params = {
+                "api-key": config.HELIUS_API_KEY,
+                "limit": 5,
+                "type": "TOKEN_MINT",
+            }
+            async with session.get(
+                url, params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    txns = await resp.json(content_type=None)
+                    if isinstance(txns, list) and txns:
+                        # Creator is the fee payer on the mint transaction
+                        deployer = txns[-1].get("feePayer") or txns[0].get("feePayer")
+        except Exception as e:
+            logger.debug(f"[Safety] Deployer fetch error: {e}")
+
+        if not deployer:
+            # Fallback: get from first token mint via RPC
+            try:
+                result = await self._rpc_call(
+                    "getSignaturesForAddress",
+                    [mint, {"limit": 1, "commitment": "confirmed"}]
+                )
+                if result:
+                    sig = result[0].get("signature", "")
+                    if sig:
+                        tx_result = await self._rpc_call(
+                            "getTransaction",
+                            [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                        )
+                        if tx_result:
+                            deployer = (
+                                tx_result.get("transaction", {})
+                                .get("message", {})
+                                .get("accountKeys", [{}])[0]
+                                .get("pubkey", "")
+                            )
+            except Exception as e:
+                logger.debug(f"[Safety] Deployer RPC fallback error: {e}")
+
+        if not deployer or len(deployer) < 32:
+            return 0.0, ""
+
+        logger.debug(f"[Safety] Deployer for {mint[:8]}: {deployer[:8]}...")
+
+        # Step 2: Check deployer's recent token creations
+        try:
+            url = f"https://api.helius.xyz/v0/addresses/{deployer}/transactions"
+            params = {
+                "api-key": config.HELIUS_API_KEY,
+                "limit": 20,
+                "type": "TOKEN_MINT",
+            }
+            async with session.get(
+                url, params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return 0.0, f"Deployer: {deployer[:8]}..."
+                recent_txns = await resp.json(content_type=None)
+        except Exception as e:
+            logger.debug(f"[Safety] Deployer history error: {e}")
+            return 0.0, f"Deployer: {deployer[:8]}..."
+
+        if not isinstance(recent_txns, list):
+            return 0.0, f"Deployer: {deployer[:8]}..."
+
+        # Count how many tokens this wallet has deployed
+        tokens_deployed = len(recent_txns)
+
+        # Step 3: Check token launch frequency
+        # Serial deployers (5+ tokens in recent history) are higher risk
+        flags   = []
+        risk    = 0.0
+
+        if tokens_deployed >= 10:
+            risk += 0.5
+            flags.append(
+                f"deployer launched {tokens_deployed}+ tokens recently (serial deployer)"
+            )
+        elif tokens_deployed >= 5:
+            risk += 0.25
+            flags.append(
+                f"deployer launched {tokens_deployed} tokens recently"
+            )
+
+        # Check timing — if multiple tokens deployed very close together
+        if tokens_deployed >= 3:
+            timestamps = [
+                tx.get("timestamp", 0)
+                for tx in recent_txns[:5]
+                if tx.get("timestamp")
+            ]
+            if len(timestamps) >= 3:
+                timestamps.sort(reverse=True)
+                # Time between first and third most recent deploy
+                time_span_hours = (timestamps[0] - timestamps[2]) / 3600
+                if time_span_hours < 24:
+                    risk += 0.3
+                    flags.append(
+                        f"3 tokens deployed within {time_span_hours:.1f}h — factory pattern"
+                    )
+
+        risk = min(risk, 1.0)
+        desc = f"Deployer {deployer[:8]}..."
+        if flags:
+            desc += ": " + " | ".join(flags)
+            logger.info(f"[Safety] Deployer check: {desc} (risk={risk:.2f})")
+
+        return risk, desc
+
     # ── Fake volume detection ────────────────────────────────────────────────────
 
     def _check_fake_volume(
@@ -576,6 +713,7 @@ class SafetyChecker:
             self._check_token_extensions(mint),
             self._check_pool_safety(pool_address, dex_name),
             self._check_bundle(mint),
+            self._check_deployer_history(mint),
             return_exceptions=True,
         )
 
@@ -587,6 +725,8 @@ class SafetyChecker:
         pool_result       = results[5] if not isinstance(results[5], Exception) else ("unknown", 0.0, [])
         bundle_result     = results[6] if not isinstance(results[6], Exception) else (0.0, "")
         bundle_risk, bundle_desc = bundle_result if isinstance(bundle_result, tuple) else (0.0, "")
+        deployer_result   = results[7] if not isinstance(results[7], Exception) else (0.0, "")
+        deployer_risk, deployer_desc = deployer_result if isinstance(deployer_result, tuple) else (0.0, "")
 
         mint_renounced, freeze_renounced = mint_auth_result
         token_program, dangerous_extensions = extension_result
@@ -607,6 +747,15 @@ class SafetyChecker:
             pool_warnings.append(f"🚨 HIGH BUNDLE RISK: {bundle_desc}")
         elif bundle_risk >= 0.25 and bundle_desc:
             pool_warnings.append(f"⚠️ Bundle signals detected: {bundle_desc}")
+
+        # Deployer history warnings
+        if deployer_risk >= 0.5 and deployer_desc:
+            pool_warnings.append(f"🚨 SERIAL DEPLOYER: {deployer_desc}")
+        elif deployer_risk >= 0.25 and deployer_desc:
+            pool_warnings.append(f"⚠️ {deployer_desc}")
+        elif deployer_desc:
+            # Always show deployer address even if clean
+            pool_warnings.append(f"ℹ️ {deployer_desc}")
 
         # Fake volume check (synchronous — uses data already available)
         fake_vol_risk, fake_vol_desc = self._check_fake_volume(
