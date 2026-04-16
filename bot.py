@@ -371,7 +371,7 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
     }.get(entry_grade, "⚪")
     # Current WAT time for display
     import datetime as _dt2
-    _wat_now = _dt2.datetime.utcnow() + _dt2.timedelta(hours=1)
+    _wat_now = _dt2.datetime.now(_dt2.timezone.utc) + _dt2.timedelta(hours=1)
     _wat_str = _wat_now.strftime("%H:%M WAT")
 
     entry_block = (
@@ -380,11 +380,15 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"<i>🕐 Alert time: {_wat_str}</i>\n\n"
     )
 
-    # Narrative fit check
-    fits_narrative, narrative_fit_desc = narrative_tracker.get_token_narrative_fit(
-        opp.name, opp.symbol
-    )
-    narrative_section = narrative_tracker.state.format_for_alert()
+    # Only show narrative context when the tracker has been refreshed recently.
+    fits_narrative = False
+    narrative_fit_desc = ""
+    narrative_section = ""
+    if narrative_tracker.state.is_fresh():
+        fits_narrative, narrative_fit_desc = narrative_tracker.get_token_narrative_fit(
+            opp.name, opp.symbol
+        )
+        narrative_section = narrative_tracker.state.format_for_alert()
 
     # Narrative match bonus note
     narrative_match_line = ""
@@ -422,6 +426,7 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"{conf_emoji} <b>Confidence: {opp.confidence}/10</b>\n"
         f"<i>{html.escape(opp.confidence_rationale)}</i>\n\n"
         f"{entry_block}"
+        f"{narrative_match_line}"
         f"{'━' * 28}\n"
         + (f"{narrative_section}\n{'━' * 28}\n" if narrative_section else "")
         + f"💸 Buy size: <b>{_get_buy_amount(opp.confidence)} SOL</b>"
@@ -719,6 +724,7 @@ async def _run_scan_cycle(
 
     try:
         opportunities = await scout.scan_for_opportunities()
+        await narrative_tracker.update()
 
         if not opportunities:
             if status_msg:
@@ -739,7 +745,12 @@ async def _run_scan_cycle(
             try:
                 # Safety check
                 safety_result = await safety_checker.full_safety_check(
-                    opp.mint, opp.pool_address, opp.dex
+                    opp.mint,
+                    opp.pool_address,
+                    opp.dex,
+                    volume_24h=opp.volume_24h_usd,
+                    liquidity=opp.liquidity_usd,
+                    txns_24h=opp.txns_24h,
                 )
                 opp.safety_passed = safety_result.passed
                 opp.safety_detail = safety_result.detail

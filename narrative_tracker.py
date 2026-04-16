@@ -133,7 +133,7 @@ class NarrativeState:
 
     def format_for_alert(self) -> str:
         """Short summary for inclusion in token alerts."""
-        if not self.top_trends:
+        if not self.top_trends or not self.is_fresh():
             return ""
 
         lines = ["🧠 <b>Market Narrative</b>"]
@@ -354,8 +354,11 @@ class NarrativeTracker:
             combined[cat] += cnt * 2  # boost signal weighted 2x
 
         if not combined:
-            # No data yet — state stays empty
+            # No data yet — clear any previous state so alerts don't show stale narratives
+            self.state.top_trends = []
+            self.state.macro_signals = self._macro_signals.copy()
             self.state.last_updated = time.time()
+            self.state.total_tokens_seen = 0
             return
 
         # Classify trend strength
