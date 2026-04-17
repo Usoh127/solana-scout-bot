@@ -395,6 +395,45 @@ class WalletTracker:
     def register_alert_callback(self, cb: Callable):
         self._alert_callbacks.append(cb)
 
+    async def _enrich_token_info(
+        self, mint: str, symbol: str, name: str
+    ) -> tuple[str, str]:
+        """
+        If symbol is unknown, query DexScreener to get real token name/ticker.
+        Free, no API key needed.
+        """
+        if symbol not in ("???", "") and not name.endswith("..."):
+            return name, symbol
+        try:
+            session = await self._get_session()
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status != 200:
+                    return name, symbol
+                data = await resp.json(content_type=None)
+                pairs = data.get("pairs") or []
+                if not pairs:
+                    return name, symbol
+                pairs.sort(
+                    key=lambda p: float(
+                        (p.get("liquidity") or {}).get("usd") or 0
+                    ),
+                    reverse=True,
+                )
+                base = pairs[0].get("baseToken") or {}
+                enriched_name   = base.get("name", name)
+                enriched_symbol = base.get("symbol", symbol)
+                logger.info(
+                    f"[WalletTracker] Enriched {mint[:8]} "
+                    f"→ ${enriched_symbol} ({enriched_name})"
+                )
+                return enriched_name, enriched_symbol
+        except Exception as e:
+            logger.debug(f"[WalletTracker] Enrichment error: {e}")
+            return name, symbol
+
     async def _fire_alert(self, alert: WalletBuyAlert):
         for cb in self._alert_callbacks:
             try:
@@ -442,9 +481,18 @@ class WalletTracker:
                 for wallet_addr in involved:
                     alert = self._parse_swap_buy(tx, wallet_addr)
                     if alert:
+                        # Enrich unknown token names from DexScreener
+                        alert.token_name, alert.token_symbol = (
+                            await self._enrich_token_info(
+                                alert.token_mint,
+                                alert.token_symbol,
+                                alert.token_name,
+                            )
+                        )
                         logger.info(
                             f"[WalletTracker] {alert.wallet_name} bought "
-                            f"{alert.token_symbol} — {alert.sol_spent:.3f} SOL"
+                            f"${alert.token_symbol} ({alert.token_name}) "
+                            f"— {alert.sol_spent:.3f} SOL"
                         )
                         await self._fire_alert(alert)
 
