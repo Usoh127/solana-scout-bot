@@ -191,6 +191,39 @@ class WalletTracker:
     def list_wallets(self) -> list[TrackedWallet]:
         return list(self.wallets.values())
 
+    async def get_sol_balance(self, address: str) -> Optional[float]:
+        """Fetch SOL balance for a tracked wallet."""
+        session = await self._get_session()
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [address, {"commitment": "confirmed"}],
+        }
+        try:
+            async with session.post(
+                config.helius_rpc_url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                lamports = (data.get("result") or {}).get("value", 0)
+                return lamports / 1e9
+        except Exception as e:
+            logger.warning(f"[WalletTracker] SOL balance error for {address[:8]}: {e}")
+            return None
+
+    async def get_all_wallet_balances(
+        self,
+    ) -> list[tuple[TrackedWallet, Optional[float]]]:
+        """Fetch SOL balances for every tracked wallet."""
+        balances = []
+        for wallet in self.list_wallets():
+            balance = await self.get_sol_balance(wallet.address)
+            balances.append((wallet, balance))
+            await asyncio.sleep(0.1)
+        return balances
+
     # ── Helius webhook registration ────────────────────────────────────────────
 
     async def register_webhook(self, public_url: str) -> bool:
@@ -540,6 +573,13 @@ class WalletTracker:
                             break   # transactions are newest-first
                         alert = self._parse_swap_buy(tx, addr)
                         if alert:
+                            alert.token_name, alert.token_symbol = (
+                                await self._enrich_token_info(
+                                    alert.token_mint,
+                                    alert.token_symbol,
+                                    alert.token_name,
+                                )
+                            )
                             alerts.append(alert)
 
             except Exception as e:

@@ -1,11 +1,13 @@
 import asyncio
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bot import _build_briefing, _compute_confidence, _run_scan_cycle
+from bot import _build_briefing, _compute_confidence, _run_scan_cycle, cmd_walletbalances
 from narrative_tracker import NarrativeTrend, narrative_tracker
 from scout import TokenOpportunity
+from wallet_tracker import TrackedWallet
 
 
 class FakeBot:
@@ -20,6 +22,35 @@ class FakeContext:
     def __init__(self):
         self.bot = FakeBot()
         self.bot_data = {"chat_id": 12345}
+        self.args = []
+
+
+class FakeReplyMessage:
+    def __init__(self):
+        self.text = None
+        self.parse_mode = None
+
+    async def edit_text(self, text, parse_mode=None):
+        self.text = text
+        self.parse_mode = parse_mode
+
+
+class FakeIncomingMessage:
+    def __init__(self):
+        self.replies = []
+
+    async def reply_text(self, text, parse_mode=None):
+        reply = FakeReplyMessage()
+        reply.text = text
+        reply.parse_mode = parse_mode
+        self.replies.append(reply)
+        return reply
+
+
+class FakeUpdate:
+    def __init__(self):
+        self.effective_user = SimpleNamespace(id=1)
+        self.message = FakeIncomingMessage()
 
 
 class FakeSafetyResult:
@@ -222,6 +253,31 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(0.3, opp.safety_bundle_risk)
         self.assertEqual(0.6, opp.safety_fake_volume_risk)
         self.assertEqual(0.5, opp.safety_deployer_risk)
+
+    def test_walletbalances_command_lists_all_tracked_wallets(self):
+        update = FakeUpdate()
+        context = FakeContext()
+        wallets = [
+            TrackedWallet(address="Wallet1111111111111111111111111111111111", name="Whale One"),
+            TrackedWallet(address="Wallet2222222222222222222222222222222222", name="Whale Two"),
+        ]
+        balances = [
+            (wallets[0], 12.3456),
+            (wallets[1], None),
+        ]
+
+        with patch("bot._is_authorized", return_value=True), \
+             patch("bot.wallet_tracker.list_wallets", return_value=wallets), \
+             patch("bot.wallet_tracker.get_all_wallet_balances", AsyncMock(return_value=balances)):
+            asyncio.run(cmd_walletbalances(update, context))
+
+        self.assertEqual(1, len(update.message.replies))
+        final_text = update.message.replies[0].text
+        self.assertIn("Copytrading Wallet Balances", final_text)
+        self.assertIn("Whale One", final_text)
+        self.assertIn("12.3456 SOL", final_text)
+        self.assertIn("Whale Two", final_text)
+        self.assertIn("unavailable", final_text)
 
 
 if __name__ == "__main__":
