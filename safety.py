@@ -67,6 +67,13 @@ class SafetyResult:
     token_program:             str  = "unknown"
     pool_creator:              str  = "unknown"
     pool_fee_rate:             float = 0.0
+    lp_lock_verified:          bool = False
+    bundle_risk:               float = 0.0
+    bundle_detail:             str = ""
+    fake_volume_risk:          float = 0.0
+    fake_volume_detail:        str = ""
+    deployer_risk:             float = 0.0
+    deployer_detail:           str = ""
 
 
 class SafetyChecker:
@@ -826,4 +833,11 @@ class SafetyChecker:
             token_program=token_program,
             pool_creator=pool_creator,
             pool_fee_rate=pool_fee_rate,
+            lp_lock_verified=lp_burned is not None,
+            bundle_risk=bundle_risk,
+            bundle_detail=bundle_desc,
+            fake_volume_risk=fake_vol_risk,
+            fake_volume_detail=fake_vol_desc,
+            deployer_risk=deployer_risk,
+            deployer_detail=deployer_desc,
         )

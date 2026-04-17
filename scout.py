@@ -88,6 +88,11 @@ class TokenOpportunity:
     # populated by safety checker later
     safety_passed: Optional[bool] = None
     safety_detail: str = ""
+    safety_top10_holder_pct: float = 0.0
+    safety_lp_lock_verified: Optional[bool] = None
+    safety_bundle_risk: float = 0.0
+    safety_fake_volume_risk: float = 0.0
+    safety_deployer_risk: float = 0.0
 
     # populated by sentiment analyzer later
     sentiment_label: str = ""        # Bullish / Neutral / Bearish

@@ -3,7 +3,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from bot import _build_briefing, _run_scan_cycle
+from bot import _build_briefing, _compute_confidence, _run_scan_cycle
 from narrative_tracker import NarrativeTrend, narrative_tracker
 from scout import TokenOpportunity
 
@@ -26,6 +26,11 @@ class FakeSafetyResult:
     def __init__(self, passed=True, detail="safe"):
         self.passed = passed
         self.detail = detail
+        self.top10_holder_pct = 0.0
+        self.lp_lock_verified = True
+        self.bundle_risk = 0.0
+        self.fake_volume_risk = 0.0
+        self.deployer_risk = 0.0
 
 
 class FakeSentimentResult:
@@ -161,6 +166,62 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(opp.volume_24h_usd, kwargs["volume_24h"])
         self.assertEqual(opp.liquidity_usd, kwargs["liquidity"])
         self.assertEqual(opp.txns_24h, kwargs["txns_24h"])
+
+    def test_confidence_uses_structured_safety_risks_without_text_match(self):
+        opp = make_opportunity()
+        opp.safety_passed = True
+        opp.safety_detail = "custom wording that omits legacy warning phrases"
+        opp.sentiment_label = "Bullish"
+        opp.tweet_count = 25
+        opp.safety_bundle_risk = 0.6
+        opp.safety_fake_volume_risk = 0.6
+        opp.safety_deployer_risk = 0.6
+        opp.safety_lp_lock_verified = False
+
+        confidence, rationale = _compute_confidence(opp)
+
+        self.assertEqual(1, confidence)
+        self.assertIn("high bundle risk", rationale)
+
+    def test_confidence_falls_back_to_legacy_text_when_structured_fields_missing(self):
+        opp = make_opportunity()
+        opp.safety_passed = True
+        opp.safety_detail = (
+            "⚠️ LP lock unverified\n"
+            "⚠️ Bundle signals detected: coordinated buyers\n"
+            "⚠️ Volume quality concern: elevated ratio\n"
+            "⚠️ Deployer abc123: 3 tokens deployed within 2.0h — factory pattern"
+        )
+        opp.sentiment_label = "Bullish"
+        opp.tweet_count = 25
+        opp.safety_lp_lock_verified = None
+
+        confidence, rationale = _compute_confidence(opp)
+
+        self.assertLess(confidence, 10)
+        self.assertIn("mild bundle signals", rationale)
+
+    def test_scan_cycle_maps_structured_safety_fields_to_opportunity(self):
+        opp = make_opportunity()
+        context = FakeContext()
+        safety_result = FakeSafetyResult()
+        safety_result.top10_holder_pct = 41.0
+        safety_result.lp_lock_verified = False
+        safety_result.bundle_risk = 0.3
+        safety_result.fake_volume_risk = 0.6
+        safety_result.deployer_risk = 0.5
+
+        with patch("bot.scout.scan_for_opportunities", AsyncMock(return_value=[opp])), \
+             patch("bot.narrative_tracker.update", AsyncMock()), \
+             patch("bot.safety_checker.full_safety_check", AsyncMock(return_value=safety_result)), \
+             patch("bot.sentiment_analyzer.analyze", AsyncMock(return_value=FakeSentimentResult())):
+            asyncio.run(_run_scan_cycle(context))
+
+        self.assertEqual(41.0, opp.safety_top10_holder_pct)
+        self.assertFalse(opp.safety_lp_lock_verified)
+        self.assertEqual(0.3, opp.safety_bundle_risk)
+        self.assertEqual(0.6, opp.safety_fake_volume_risk)
+        self.assertEqual(0.5, opp.safety_deployer_risk)
 
 
 if __name__ == "__main__":

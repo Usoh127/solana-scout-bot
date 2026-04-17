@@ -100,6 +100,14 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
     Score 1-10 with hard penalties for holder concentration and LP issues.
     """
     import re
+
+    def _risk_attr(*names: str, default: float = 0.0) -> float:
+        for name in names:
+            value = getattr(opp, name, None)
+            if value is not None:
+                return float(value)
+        return default
+
     score = 0
     reasons = []
     penalties = []
@@ -137,8 +145,8 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score += 1
         reasons.append("decent vol/liq")
 
-    holder_pct = 0.0
-    if opp.safety_detail:
+    holder_pct = _risk_attr("safety_top10_holder_pct", default=0.0)
+    if holder_pct <= 0 and opp.safety_detail:
         for line in opp.safety_detail.splitlines():
             if "Top-10 holders" in line or "top-10" in line.lower():
                 match = re.search(r"(\d+\.?\d*)%", line)
@@ -156,7 +164,11 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score -= 1
         penalties.append(f"⚠️ top-10 own {holder_pct:.0f}% — elevated dump risk")
 
-    if opp.safety_detail and "LP lock unverified" in opp.safety_detail:
+    lp_lock_verified = getattr(opp, "safety_lp_lock_verified", None)
+    if lp_lock_verified is False:
+        score -= 1
+        penalties.append("⚠️ LP lock unverified")
+    elif lp_lock_verified is None and opp.safety_detail and "LP lock unverified" in opp.safety_detail:
         score -= 1
         penalties.append("⚠️ LP lock unverified")
 
@@ -166,7 +178,14 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         reasons.append("DEX Enhanced paid ✅")
 
     # Bundle risk penalty
-    if opp.safety_detail and "HIGH BUNDLE RISK" in opp.safety_detail:
+    bundle_risk = _risk_attr("safety_bundle_risk", default=0.0)
+    if bundle_risk >= 0.5:
+        score -= 3
+        penalties.append("high bundle risk 🚨")
+    elif bundle_risk >= 0.25:
+        score -= 1
+        penalties.append("mild bundle signals")
+    elif opp.safety_detail and "HIGH BUNDLE RISK" in opp.safety_detail:
         score -= 3
         penalties.append("high bundle risk 🚨")
     elif opp.safety_detail and "Bundle signals" in opp.safety_detail:
@@ -174,7 +193,14 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         penalties.append("mild bundle signals")
 
     # Fake volume penalty
-    if opp.safety_detail and "FAKE VOLUME LIKELY" in opp.safety_detail:
+    fake_volume_risk = _risk_attr("safety_fake_volume_risk", default=0.0)
+    if fake_volume_risk >= 0.5:
+        score -= 3
+        penalties.append("likely fake volume 🚨")
+    elif fake_volume_risk >= 0.25:
+        score -= 1
+        penalties.append("volume quality concern")
+    elif opp.safety_detail and "FAKE VOLUME LIKELY" in opp.safety_detail:
         score -= 3
         penalties.append("likely fake volume 🚨")
     elif opp.safety_detail and "Volume quality concern" in opp.safety_detail:
@@ -182,7 +208,14 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         penalties.append("volume quality concern")
 
     # Deployer history penalty
-    if opp.safety_detail and "SERIAL DEPLOYER" in opp.safety_detail:
+    deployer_risk = _risk_attr("safety_deployer_risk", default=0.0)
+    if deployer_risk >= 0.5:
+        score -= 3
+        penalties.append("serial deployer 🚨")
+    elif deployer_risk >= 0.25:
+        score -= 2
+        penalties.append("deployer factory pattern")
+    elif opp.safety_detail and "SERIAL DEPLOYER" in opp.safety_detail:
         score -= 3
         penalties.append("serial deployer 🚨")
     elif opp.safety_detail and "factory pattern" in opp.safety_detail:
@@ -797,6 +830,11 @@ async def _run_scan_cycle(
                 )
                 opp.safety_passed = safety_result.passed
                 opp.safety_detail = safety_result.detail
+                opp.safety_top10_holder_pct = safety_result.top10_holder_pct
+                opp.safety_lp_lock_verified = safety_result.lp_lock_verified
+                opp.safety_bundle_risk = safety_result.bundle_risk
+                opp.safety_fake_volume_risk = safety_result.fake_volume_risk
+                opp.safety_deployer_risk = safety_result.deployer_risk
 
                 if not safety_result.passed:
                     logger.info(
