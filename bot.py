@@ -160,6 +160,49 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score -= 1
         penalties.append("⚠️ LP lock unverified")
 
+    # DEX Enhanced paid listing bonus
+    if hasattr(opp, "dex_paid") and opp.dex_paid:
+        score += 1
+        reasons.append("DEX Enhanced paid ✅")
+
+    # Bundle risk penalty
+    if opp.safety_detail and "HIGH BUNDLE RISK" in opp.safety_detail:
+        score -= 3
+        penalties.append("high bundle risk 🚨")
+    elif opp.safety_detail and "Bundle signals" in opp.safety_detail:
+        score -= 1
+        penalties.append("mild bundle signals")
+
+    # Fake volume penalty
+    if opp.safety_detail and "FAKE VOLUME LIKELY" in opp.safety_detail:
+        score -= 3
+        penalties.append("likely fake volume 🚨")
+    elif opp.safety_detail and "Volume quality concern" in opp.safety_detail:
+        score -= 1
+        penalties.append("volume quality concern")
+
+    # Deployer history penalty
+    if opp.safety_detail and "SERIAL DEPLOYER" in opp.safety_detail:
+        score -= 3
+        penalties.append("serial deployer 🚨")
+    elif opp.safety_detail and "factory pattern" in opp.safety_detail:
+        score -= 2
+        penalties.append("deployer factory pattern")
+
+    # Narrative fit bonus
+    if narrative_tracker.state.is_fresh():
+        fits_narrative, _ = narrative_tracker.get_token_narrative_fit(
+            opp.name, opp.symbol
+        )
+        if fits_narrative:
+            score += 1
+            reasons.append("fits trending narrative 🎯")
+
+    # Copycat penalty
+    if hasattr(opp, "possible_copycat") and opp.possible_copycat:
+        score -= 2
+        penalties.append("possible copycat ⚠️")
+
     score = max(1, min(10, score))
     rationale = " · ".join((reasons[:2] + penalties[:2]))
     return score, rationale
