@@ -29,7 +29,13 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Optional
+from typing import Optional, Set
+
+try:
+    import websockets
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
 
 import aiohttp
 
@@ -56,6 +62,11 @@ POSITIONS_FILE = os.environ.get(
     "POSITIONS_FILE",
     "/data/positions.json" if os.path.isdir("/data") else "positions.json"
 )
+
+# Helius websocket endpoint (standard WSS — free tier)
+HELIUS_WSS = "wss://mainnet.helius-rpc.com/"
+
+# ── WebSocket position monitor ─────────────────────────────────────────────────
 
 # Alert type constants
 ALERT_STOP_LOSS        = "stop_loss"
@@ -131,6 +142,225 @@ class MonitorAlert:
 
 # ─── Monitor ──────────────────────────────────────────────────────────────────
 
+class WebSocketMonitor:
+    """
+    Real-time position monitor using Helius WebSocket (logsSubscribe).
+
+    Watches pool addresses of open positions. The moment any swap transaction
+    hits the pool, we get notified and immediately check stop loss / take profit.
+
+    Reaction time: <1 second vs 30-second polling.
+
+    Uses standard logsSubscribe (free on all Helius plans).
+    Falls back to polling silently if websocket fails or API key missing.
+    """
+
+    PING_INTERVAL = 60   # send ping every 60s to keep connection alive
+    RECONNECT_DELAY = 5  # seconds before reconnecting after disconnect
+
+    def __init__(self, position_monitor: "PositionMonitor"):
+        self._pm              = position_monitor
+        self._ws              = None
+        self._running         = False
+        self._subscriptions: dict[int, str] = {}   # sub_id -> mint
+        self._pending_subs: dict[str, str]  = {}   # request_id -> mint
+        self._sub_counter     = 1
+        self._connected       = False
+
+    def _ws_url(self) -> Optional[str]:
+        from config import config
+        if not config.has_helius:
+            return None
+        return f"{HELIUS_WSS}?api-key={config.HELIUS_API_KEY}"
+
+    async def start(self):
+        """Start the websocket monitor loop. Runs forever with auto-reconnect."""
+        if not HAS_WEBSOCKETS:
+            logger.warning(
+                "[WSMonitor] websockets package not installed — "
+                "falling back to 30s polling. Run: pip install websockets"
+            )
+            return
+
+        url = self._ws_url()
+        if not url:
+            logger.info("[WSMonitor] No Helius key — using polling monitor only")
+            return
+
+        self._running = True
+        logger.info("[WSMonitor] Starting real-time websocket monitor")
+        while self._running:
+            try:
+                await self._connect_and_run(url)
+            except Exception as e:
+                if self._running:
+                    logger.warning(
+                        f"[WSMonitor] Disconnected ({e}), "
+                        f"reconnecting in {self.RECONNECT_DELAY}s..."
+                    )
+                    await asyncio.sleep(self.RECONNECT_DELAY)
+
+    async def _connect_and_run(self, url: str):
+        async with websockets.connect(
+            url,
+            ping_interval=None,   # we handle pings manually
+            open_timeout=10,
+            close_timeout=5,
+        ) as ws:
+            self._ws        = ws
+            self._connected = True
+            self._subscriptions.clear()
+            self._pending_subs.clear()
+            logger.info("[WSMonitor] Connected to Helius WebSocket")
+
+            # Subscribe to all current positions
+            for mint in list(self._pm.positions.keys()):
+                pos = self._pm.positions.get(mint)
+                if pos and pos.pool_address:
+                    await self._subscribe(pos.pool_address, mint)
+
+            # Run receive loop + ping loop concurrently
+            await asyncio.gather(
+                self._receive_loop(ws),
+                self._ping_loop(ws),
+            )
+
+    async def _subscribe(self, pool_address: str, mint: str):
+        """Subscribe to logs for a pool address."""
+        if not self._ws or not self._connected:
+            return
+        req_id = str(self._sub_counter)
+        self._sub_counter += 1
+        self._pending_subs[req_id] = mint
+
+        msg = json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "logsSubscribe",
+            "params": [
+                {"mentions": [pool_address]},
+                {"commitment": "confirmed"}
+            ]
+        })
+        try:
+            await self._ws.send(msg)
+            logger.debug(
+                f"[WSMonitor] Subscribed to pool {pool_address[:8]}... "
+                f"for {self._pm.positions.get(mint, type('', (), {'symbol': mint[:8]})()).symbol}"
+            )
+        except Exception as e:
+            logger.debug(f"[WSMonitor] Subscribe error: {e}")
+
+    async def _unsubscribe(self, sub_id: int):
+        """Unsubscribe from a pool."""
+        if not self._ws or not self._connected:
+            return
+        msg = json.dumps({
+            "jsonrpc": "2.0",
+            "id": str(self._sub_counter),
+            "method": "logsUnsubscribe",
+            "params": [sub_id]
+        })
+        self._sub_counter += 1
+        try:
+            await self._ws.send(msg)
+        except Exception:
+            pass
+
+    async def _receive_loop(self, ws):
+        """Process incoming websocket messages."""
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+
+            # Subscription confirmation
+            if "id" in msg and "result" in msg:
+                req_id = str(msg["id"])
+                if req_id in self._pending_subs:
+                    mint = self._pending_subs.pop(req_id)
+                    sub_id = msg["result"]
+                    self._subscriptions[sub_id] = mint
+                    logger.debug(
+                        f"[WSMonitor] Subscription confirmed — "
+                        f"watching {mint[:8]}... (sub_id={sub_id})"
+                    )
+                continue
+
+            # Incoming log notification
+            if msg.get("method") == "logsNotification":
+                params = msg.get("params", {})
+                result = params.get("result", {})
+                sub_id = params.get("subscription")
+                mint   = self._subscriptions.get(sub_id)
+
+                if not mint:
+                    continue
+
+                # Check if it's an error log (not a swap)
+                context = result.get("value", {})
+                logs    = context.get("logs", [])
+                err     = context.get("err")
+
+                if err:
+                    continue   # failed transaction, skip
+
+                # Any successful transaction touching the pool = potential swap
+                # Trigger immediate position check
+                pos = self._pm.positions.get(mint)
+                if pos:
+                    logger.debug(
+                        f"[WSMonitor] Pool activity detected for "
+                        f"{pos.symbol} — checking immediately"
+                    )
+                    asyncio.create_task(self._check_now(mint))
+
+    async def _check_now(self, mint: str):
+        """Immediately run position check — called on any pool activity."""
+        try:
+            alert = await self._pm.check_position(mint)
+            if alert:
+                await self._pm._fire_alert(alert)
+                pos = self._pm.positions.get(mint)
+                if pos and pos.tokens_remaining <= 0:
+                    self._pm.remove_position(mint)
+                    # Unsubscribe from the pool
+                    for sub_id, m in list(self._subscriptions.items()):
+                        if m == mint:
+                            await self._unsubscribe(sub_id)
+                            del self._subscriptions[sub_id]
+                            break
+        except Exception as e:
+            logger.debug(f"[WSMonitor] Immediate check error: {e}")
+
+    async def _ping_loop(self, ws):
+        """Send ping every 60s to keep connection alive."""
+        while self._connected:
+            await asyncio.sleep(self.PING_INTERVAL)
+            try:
+                await ws.ping()
+            except Exception:
+                break
+
+    async def on_position_added(self, pos: "Position"):
+        """Called when a new position is opened — subscribe immediately."""
+        if self._connected and pos.pool_address:
+            await self._subscribe(pos.pool_address, pos.mint)
+
+    async def on_position_removed(self, mint: str):
+        """Called when position is closed — unsubscribe."""
+        for sub_id, m in list(self._subscriptions.items()):
+            if m == mint:
+                await self._unsubscribe(sub_id)
+                del self._subscriptions[sub_id]
+                break
+
+    def stop(self):
+        self._running   = False
+        self._connected = False
+
+
 class PositionMonitor:
     def __init__(self, sentiment_analyzer: SentimentAnalyzer):
         self.positions: dict[str, Position] = {}
@@ -171,12 +401,22 @@ class PositionMonitor:
             f"liq ${position.liquidity_at_buy:,.0f}, "
             f"age {position.token_age_at_buy:.1f}h"
         )
+        # Notify websocket monitor to subscribe to this pool
+        if self.ws_monitor and position.pool_address:
+            asyncio.create_task(
+                self.ws_monitor.on_position_added(position)
+            )
 
     def remove_position(self, mint: str):
         if mint in self.positions:
             p = self.positions.pop(mint)
             self._save_positions()
             logger.info(f"[Monitor] Removed position: {p.symbol}")
+            # Unsubscribe from pool websocket
+            if self.ws_monitor:
+                asyncio.create_task(
+                    self.ws_monitor.on_position_removed(mint)
+                )
 
     def has_position(self, mint: str) -> bool:
         return mint in self.positions
@@ -186,6 +426,19 @@ class PositionMonitor:
 
     def list_positions(self) -> list[Position]:
         return list(self.positions.values())
+
+    async def start_ws_monitor(self):
+        """
+        Start the real-time websocket monitor.
+        Call this once during bot startup.
+        Runs in background — polling continues as fallback.
+        """
+        self.ws_monitor = WebSocketMonitor(self)
+        asyncio.create_task(self.ws_monitor.start())
+        logger.info(
+            "[Monitor] Real-time websocket monitor started "
+            "(30s polling still runs as fallback)"
+        )
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
