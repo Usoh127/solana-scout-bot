@@ -20,6 +20,7 @@ Policy:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -83,6 +84,12 @@ class SentimentAnalyzer:
         self._twitter_cache: dict[str, tuple[float, tuple]] = {}
         # Track if NewsAPI is rate limited today — stop hitting it until midnight
         self._newsapi_blocked_until: float = 0.0
+
+        # Grok X search cache — 15 min per ticker (same as Twitter window)
+        self._grok_cache: dict[str, tuple[float, tuple]] = {}
+
+        # xAI API base URL
+        self._xai_base = "https://api.x.ai/v1"
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -342,6 +349,130 @@ class SentimentAnalyzer:
 
     # ── NewsAPI ────────────────────────────────────────────────────────────────
 
+    async def _search_grok_x(
+        self, token_name: str, ticker: str
+    ) -> tuple[int, float, str, bool]:
+        """
+        Use xAI Grok API to search real-time X (Twitter) data.
+
+        Grok has native X access — it reads live tweets and synthesizes them.
+        Much cheaper than Twitter API ($5/1000 calls vs $100/month for Basic).
+        Returns same format as _search_twitter_v2 for drop-in compatibility.
+
+        Returns (tweet_count_estimate, avg_sentiment, top_signal, has_notable)
+        """
+        if not config.has_grok:
+            return 0, 0.0, "", False
+
+        # 15-min cache to avoid burning credits on repeated scans
+        now = time.time()
+        cache_key = ticker.upper()
+        cached = self._grok_cache.get(cache_key)
+        if cached:
+            cached_at, result = cached
+            if now - cached_at < 900:
+                logger.debug(f"[Sentiment] Grok cache hit for {ticker}")
+                return result
+
+        def _extract_json_blob(text: str) -> str:
+            text = text.strip()
+            if text.startswith("```"):
+                lines = text.splitlines()
+                if lines and lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end >= start:
+                return text[start:end + 1]
+            return text
+
+        session = await self._get_session()
+        prompt = (
+            f"Search X right now for recent posts about the Solana memecoin "
+            f"${ticker} also known as '{token_name}'. "
+            f"Look at the last few hours of posts. "
+            f"Return a JSON object with exactly these fields: "
+            f"sentiment (one of: Bullish, Bearish, Neutral), "
+            f"tweet_count (your estimate of how many posts you found, integer), "
+            f"top_signal (one sentence summary of what people are saying, max 100 chars), "
+            f"has_notable (true if any account with 10k+ followers mentioned it, boolean), "
+            f"red_flags (any warnings like 'rug', 'scam', 'honeypot' being mentioned, boolean). "
+            f"Return ONLY the JSON, no explanation."
+        )
+
+        content = ""
+        try:
+            headers = {
+                "Authorization": f"Bearer {config.XAI_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": "grok-3-fast",
+                "messages": [{"role": "user", "content": prompt}],
+                "search_parameters": {
+                    "mode": "on",
+                    "sources": [{"type": "x"}],
+                    "from_date": None,
+                    "return_citations": False,
+                },
+                "temperature": 0,
+                "max_tokens": 200,
+            }
+            async with session.post(
+                f"{self._xai_base}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 401:
+                    logger.warning("[Sentiment] Grok API: invalid API key")
+                    return 0, 0.0, "", False
+                if resp.status == 429:
+                    logger.warning("[Sentiment] Grok API: rate limited")
+                    return 0, 0.0, "", False
+                if resp.status != 200:
+                    logger.debug(f"[Sentiment] Grok API: status {resp.status}")
+                    return 0, 0.0, "", False
+
+                data    = await resp.json(content_type=None)
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+                parsed = json.loads(_extract_json_blob(content))
+
+                sentiment_label = parsed.get("sentiment", "Neutral")
+                tweet_count     = int(parsed.get("tweet_count", 0))
+                top_signal      = str(parsed.get("top_signal", ""))[:120]
+                has_notable     = bool(parsed.get("has_notable", False))
+                red_flags       = bool(parsed.get("red_flags", False))
+
+                # Convert sentiment label to score
+                score_map = {"Bullish": 0.5, "Neutral": 0.0, "Bearish": -0.5}
+                avg_score = score_map.get(sentiment_label, 0.0)
+
+                # Red flags override to bearish
+                if red_flags:
+                    avg_score = -0.7
+                    top_signal = f"⚠️ RED FLAGS on X: {top_signal}"
+
+                logger.info(
+                    f"[Sentiment] Grok X: {ticker} → {sentiment_label} "
+                    f"(~{tweet_count} posts, notable={has_notable})"
+                )
+
+                result = (tweet_count, avg_score, top_signal, has_notable)
+                self._grok_cache[cache_key] = (now, result)
+                return result
+
+        except json.JSONDecodeError:
+            logger.debug(f"[Sentiment] Grok returned non-JSON: {content[:100]}")
+            return 0, 0.0, "", False
+        except Exception as e:
+            logger.warning(f"[Sentiment] Grok X error: {e}")
+            return 0, 0.0, "", False
+
     async def _search_news(self, token_name: str, ticker: str) -> tuple[int, float, str]:
         """
         Search NewsAPI for recent articles.
@@ -443,46 +574,56 @@ class SentimentAnalyzer:
         """
         logger.info(f"[Sentiment] Analyzing {ticker} ({token_name})")
 
-        # Run all sources in parallel
-        twitter_task = asyncio.create_task(
-            self._search_twitter_v2(token_name, ticker, mint)
-        )
-        reddit_task = asyncio.create_task(self._search_reddit(token_name, ticker))
-        news_task = asyncio.create_task(self._search_news(token_name, ticker))
-
-        results = await asyncio.gather(
-            twitter_task, reddit_task, news_task, return_exceptions=True
-        )
-
-        # Unpack twitter
+        # ── X/Twitter signal: Grok (preferred) → Twitter API → Nitter ───────────
+        # Priority: Grok if key exists (real-time, cheap), then Twitter v2,
+        # then Nitter as last resort
         tweet_count, twitter_score, top_tweet, has_notable = 0, 0.0, "", False
-        if isinstance(results[0], tuple):
-            tweet_count, twitter_score, top_tweet, has_notable = results[0]
-        elif isinstance(results[0], Exception):
-            logger.warning(f"[Sentiment] Twitter task failed: {results[0]}")
 
-        # If Twitter API got nothing, try Nitter fallback
+        if config.has_grok:
+            try:
+                grok_result = await self._search_grok_x(token_name, ticker)
+                tweet_count, twitter_score, top_tweet, has_notable = grok_result
+            except Exception as e:
+                logger.warning(f"[Sentiment] Grok failed, trying Twitter: {e}")
+
+        # Fall back to Twitter v2 if Grok got nothing or key not set
+        if tweet_count == 0 and config.has_twitter:
+            try:
+                twitter_result = await self._search_twitter_v2(token_name, ticker, mint)
+                tweet_count, twitter_score, top_tweet, has_notable = twitter_result
+            except Exception as e:
+                logger.warning(f"[Sentiment] Twitter v2 failed: {e}")
+
+        # Final fallback: Nitter
         if tweet_count == 0:
-            nitter_count, nitter_score, nitter_top = await self._search_twitter_nitter(
-                token_name, ticker
-            )
-            if nitter_count > 0:
-                tweet_count, twitter_score, top_tweet = nitter_count, nitter_score, nitter_top
-                logger.info(f"[Sentiment] Nitter fallback: {tweet_count} tweets")
+            try:
+                nitter_count, nitter_score, nitter_top = await self._search_twitter_nitter(
+                    token_name, ticker
+                )
+                if nitter_count > 0:
+                    tweet_count, twitter_score, top_tweet = nitter_count, nitter_score, nitter_top
+                    logger.info(f"[Sentiment] Nitter fallback: {tweet_count} tweets")
+            except Exception as e:
+                logger.debug(f"[Sentiment] Nitter failed: {e}")
+
+        # Run Reddit and News in parallel (unchanged)
+        reddit_task = asyncio.create_task(self._search_reddit(token_name, ticker))
+        news_task   = asyncio.create_task(self._search_news(token_name, ticker))
+        results     = await asyncio.gather(reddit_task, news_task, return_exceptions=True)
 
         # Unpack reddit
         reddit_count, reddit_score, reddit_summary = 0, 0.0, ""
-        if isinstance(results[1], tuple):
-            reddit_count, reddit_score, reddit_summary = results[1]
-        elif isinstance(results[1], Exception):
-            logger.warning(f"[Sentiment] Reddit task failed: {results[1]}")
+        if isinstance(results[0], tuple):
+            reddit_count, reddit_score, reddit_summary = results[0]
+        elif isinstance(results[0], Exception):
+            logger.warning(f"[Sentiment] Reddit task failed: {results[0]}")
 
         # Unpack news
         news_count, news_score, news_summary = 0, 0.0, ""
-        if isinstance(results[2], tuple):
-            news_count, news_score, news_summary = results[2]
-        elif isinstance(results[2], Exception):
-            logger.warning(f"[Sentiment] News task failed: {results[2]}")
+        if isinstance(results[1], tuple):
+            news_count, news_score, news_summary = results[1]
+        elif isinstance(results[1], Exception):
+            logger.warning(f"[Sentiment] News task failed: {results[1]}")
 
         has_any = tweet_count > 0 or reddit_count > 0 or news_count > 0
 

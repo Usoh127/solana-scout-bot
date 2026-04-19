@@ -86,6 +86,10 @@ class Config:
     # ⚠️  FREE TIER LIMIT: 10 search requests / 15 min, 500k tweets / month
     TWITTER_BEARER_TOKEN: str = os.getenv("TWITTER_BEARER_TOKEN", "")
 
+    # xAI Grok API — real-time X search, much cheaper than Twitter API
+    # Get key at console.x.ai — $5/1000 X searches (~$4-5/month for our usage)
+    XAI_API_KEY: str = os.getenv("XAI_API_KEY", "")
+
     # NewsAPI — free tier: 100 requests/day at newsapi.org
     # ⚠️  FREE TIER: 100 req/day, no commercial use
     NEWS_API_KEY: str = os.getenv("NEWS_API_KEY", "")
@@ -114,6 +118,10 @@ class Config:
     @property
     def has_twitter(self) -> bool:
         return bool(self.TWITTER_BEARER_TOKEN)
+
+    @property
+    def has_grok(self) -> bool:
+        return bool(self.XAI_API_KEY)
 
     @property
     def has_news(self) -> bool:

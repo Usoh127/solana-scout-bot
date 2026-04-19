@@ -93,6 +93,7 @@ class TokenOpportunity:
     safety_bundle_risk: float = 0.0
     safety_fake_volume_risk: float = 0.0
     safety_deployer_risk: float = 0.0
+    safety_deployer_address: str = ""
 
     # populated by sentiment analyzer later
     sentiment_label: str = ""        # Bullish / Neutral / Bearish
