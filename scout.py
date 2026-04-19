@@ -1,13 +1,17 @@
 """
 scout.py — Token scouting layer.
 
-Primary source:  GeckoTerminal (free, no key needed)  → new Solana pools
-Secondary:       DexScreener (free, no key needed)    → detailed pair data
-Tertiary:        Birdeye (API key needed for full data)
+Primary source:  pump.fun API (free, no key)           → brand new bonding curve tokens
+Secondary:       GeckoTerminal (free, no key needed)   → new Solana pools
+Tertiary:        DexScreener (free, no key needed)     → detailed pair data + trending
+Quaternary:      Birdeye (API key needed for full data)
+
+pump.fun is prioritised because it surfaces tokens at or near launch — before
+GeckoTerminal and DexScreener index them. This is the fix for late-signal alerts.
 
 Tokens are filtered against ALL configured thresholds before being returned.
-If a token doesn't meet MIN_LIQUIDITY_USD or MIN_VOLUME_24H_USD it is silently
-dropped — it never reaches the sentiment or briefing layers.
+pump.fun tokens are exempt from volume and price-change threshold checks since
+those data points aren't available until the token graduates or gets indexed.
 """
 
 from __future__ import annotations
@@ -31,17 +35,16 @@ logger = logging.getLogger(__name__)
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
-DEXSCREENER_BASE = "https://api.dexscreener.com"
-BIRDEYE_BASE = "https://public-api.birdeye.so"
+DEXSCREENER_BASE   = "https://api.dexscreener.com"
+BIRDEYE_BASE       = "https://public-api.birdeye.so"
+PUMPFUN_BASE       = "https://frontend-api.pump.fun"
 
-# Wrapped SOL mint address
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-# Known rug/honeypot indicator: these are burn addresses / known bad actors
 BURN_ADDRESSES = {
     "1nc1nerator11111111111111111111111111111111",
-    "So11111111111111111111111111111111111111112",  # wsol itself isn't a token
+    "So11111111111111111111111111111111111111112",
 }
 
 HEADERS_GT = {
@@ -53,7 +56,6 @@ HEADERS_BIRDEYE = {
     "x-chain": "solana",
 }
 
-# Persist seen mints so cooldown survives Railway restarts
 SEEN_MINTS_FILE = os.environ.get(
     "SEEN_MINTS_FILE",
     "/data/seen_mints.json" if os.path.isdir("/data") else "seen_mints.json"
@@ -96,8 +98,8 @@ class TokenOpportunity:
     safety_deployer_address: str = ""
 
     # populated by sentiment analyzer later
-    sentiment_label: str = ""        # Bullish / Neutral / Bearish
-    sentiment_score: float = 0.0     # -1 to 1
+    sentiment_label: str = ""
+    sentiment_score: float = 0.0
     sentiment_summary: str = ""
     tweet_count: int = 0
     top_tweet_signal: str = ""
@@ -108,7 +110,7 @@ class TokenOpportunity:
     confidence: int = 0
     confidence_rationale: str = ""
 
-    # data-only flag: set when chart is strong but social signal is weak
+    # data-only flag
     data_only_call: bool = False
     data_only_reason: str = ""
 
@@ -119,10 +121,13 @@ class TokenOpportunity:
     # DexScreener Enhanced listing paid
     dex_paid: bool = False
 
-    # Transaction count (for fake volume detection)
+    # Transaction count
     txns_24h: int = 0
 
-    # internal: track when we first saw this token so we don't re-alert
+    # pump.fun specific extras (surfaced in briefing)
+    pumpfun_reply_count: int = 0
+    pumpfun_is_koth: bool = False
+
     first_seen: float = field(default_factory=time.time)
 
     @property
@@ -157,12 +162,12 @@ async def _get_json(
     retries: int = 3,
     backoff: float = 2.0,
 ) -> dict | list | None:
-    """GET JSON with exponential backoff on 429/5xx."""
     attempt = 0
     while attempt < retries:
         try:
             async with session.get(
-                url, headers=headers or {}, params=params, timeout=aiohttp.ClientTimeout(total=15)
+                url, headers=headers or {}, params=params,
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 429:
                     wait = backoff ** attempt
@@ -197,9 +202,9 @@ async def _get_json(
 class TokenScout:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
-        self._seen_mints: dict[str, float] = {}  # mint -> last_alerted timestamp
-        self._scan_count: int = 0               # stagger GeckoTerminal calls
-        self._seen_tickers: dict[str, str] = {} # ticker -> first CA seen
+        self._seen_mints: dict[str, float] = {}
+        self._scan_count: int = 0
+        self._seen_tickers: dict[str, str] = {}
         self._load_seen_mints()
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -211,26 +216,136 @@ class TokenScout:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    # ── Source 1: GeckoTerminal new pools ─────────────────────────────────────
+    # ── Source 1: pump.fun bonding curve ──────────────────────────────────────
 
-    async def _fetch_gecko_new_pools(self) -> list[dict]:
+    async def _fetch_pumpfun_new(self) -> list[dict]:
         """
-        Fetch the most recently created Solana pools from GeckoTerminal.
-        Returns raw pool dicts with base_token info included.
+        Fetch brand new and recently active tokens from pump.fun.
+        Two queries: newest first + most recently traded.
+        This catches tokens at or near launch — before DexScreener indexes them.
         Free, no API key required.
         """
-        session = await self._get_session()
-        pools = []
+        session  = await self._get_session()
+        results  = []
+        seen_set = set()
 
-        for page in range(1, 4):  # pages 1-3, ~60 pools total
-            url = f"{GECKOTERMINAL_BASE}/networks/solana/new_pools"
+        for sort_by in ["created_timestamp", "last_trade_timestamp"]:
+            try:
+                async with session.get(
+                    f"{PUMPFUN_BASE}/coins",
+                    params={
+                        "sort":         sort_by,
+                        "order":        "DESC",
+                        "limit":        50,
+                        "includeNsfw":  "false",
+                    },
+                    headers={"Accept": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"[Scout] PumpFun {sort_by} → HTTP {resp.status}")
+                        continue
+                    coins = await resp.json(content_type=None)
+                    if not isinstance(coins, list):
+                        continue
+
+                    for coin in coins:
+                        mint = coin.get("mint", "")
+                        if not mint or mint in seen_set or mint in BURN_ADDRESSES:
+                            continue
+                        seen_set.add(mint)
+
+                        # Skip graduated tokens — DexScreener / GeckoTerminal will catch those
+                        if coin.get("complete") or coin.get("raydium_pool"):
+                            continue
+
+                        # Parse age
+                        created_ts = coin.get("created_timestamp", 0)
+                        if created_ts > 1e12:        # milliseconds → seconds
+                            created_ts /= 1000
+
+                        created_at = None
+                        age_hours  = 9999.0
+                        if created_ts:
+                            try:
+                                created_at = datetime.fromtimestamp(created_ts, tz=timezone.utc)
+                                age_hours  = (
+                                    datetime.now(timezone.utc) - created_at
+                                ).total_seconds() / 3600
+                            except Exception:
+                                pass
+
+                        # Pre-filter by age to avoid wasted threshold checks later
+                        if age_hours > config.MAX_TOKEN_AGE_HOURS:
+                            continue
+
+                        usd_mcap = float(coin.get("usd_market_cap") or 0)
+
+                        # Basic market cap gates
+                        if usd_mcap < config.MIN_MARKET_CAP_USD:
+                            continue
+                        if usd_mcap > config.MAX_MARKET_CAP_USD:
+                            continue
+
+                        # Estimate liquidity from bonding curve virtual reserves
+                        # virtual_sol_reserves is in lamports
+                        virtual_sol = coin.get("virtual_sol_reserves", 0) / 1e9
+                        # ~$150 per SOL as rough floor estimate (actual enriched by DexScreener later)
+                        est_liquidity = max(virtual_sol * 150, usd_mcap * 0.25)
+
+                        is_koth      = bool(coin.get("king_of_the_hill_timestamp"))
+                        reply_count  = int(coin.get("reply_count") or 0)
+
+                        results.append({
+                            "mint":                 mint,
+                            "name":                 coin.get("name", "Unknown"),
+                            "symbol":               coin.get("symbol", "???"),
+                            "pool_address":         coin.get("bonding_curve", ""),
+                            "dex":                  "pump.fun",
+                            "price_usd":            0.0,
+                            "market_cap_usd":       usd_mcap,
+                            "fdv_usd":              usd_mcap,
+                            "liquidity_usd":        est_liquidity,
+                            # Volume unknown until DexScreener indexes — set 0,
+                            # _meets_thresholds skips volume check for pumpfun source
+                            "volume_24h_usd":       0.0,
+                            "volume_6h_usd":        0.0,
+                            "volume_1h_usd":        0.0,
+                            # Price history unknown from pump.fun API — set 0,
+                            # _meets_thresholds skips price change check for pumpfun source
+                            "price_change_1h":      0.0,
+                            "price_change_6h":      0.0,
+                            "price_change_24h":     0.0,
+                            "launched_at":          created_at,
+                            "age_hours":            age_hours,
+                            "source":               "pumpfun",
+                            "pumpfun_reply_count":  reply_count,
+                            "pumpfun_is_koth":      is_koth,
+                        })
+
+            except Exception as e:
+                logger.warning(f"[Scout] PumpFun {sort_by} fetch error: {e}")
+
+            await asyncio.sleep(0.3)
+
+        logger.info(f"[Scout] PumpFun returned {len(results)} raw tokens")
+        return results
+
+    # ── Source 2: GeckoTerminal new pools ─────────────────────────────────────
+
+    async def _fetch_gecko_new_pools(self) -> list[dict]:
+        session = await self._get_session()
+        pools   = []
+
+        for page in range(1, 4):
+            url    = f"{GECKOTERMINAL_BASE}/networks/solana/new_pools"
             params = {"include": "base_token,dex", "page": page}
-            data = await _get_json(session, url, headers=HEADERS_GT, params=params)
+            data   = await _get_json(session, url, headers=HEADERS_GT, params=params)
             if not data:
                 break
 
             raw_pools = data.get("data", [])
-            included = {
+            included  = {
                 item["id"]: item
                 for item in data.get("included", [])
                 if item.get("type") in ("token", "dex")
@@ -239,30 +354,26 @@ class TokenScout:
             for pool in raw_pools:
                 try:
                     attrs = pool.get("attributes", {})
-                    rels = pool.get("relationships", {})
+                    rels  = pool.get("relationships", {})
 
-                    # Resolve base token
                     base_token_ref = rels.get("base_token", {}).get("data", {})
-                    base_id = base_token_ref.get("id", "")
-                    base_token = included.get(base_id, {}).get("attributes", {})
+                    base_id        = base_token_ref.get("id", "")
+                    base_token     = included.get(base_id, {}).get("attributes", {})
 
-                    # Resolve DEX name
-                    dex_ref = rels.get("dex", {}).get("data", {})
-                    dex_obj = included.get(dex_ref.get("id", ""), {})
+                    dex_ref  = rels.get("dex", {}).get("data", {})
+                    dex_obj  = included.get(dex_ref.get("id", ""), {})
                     dex_name = dex_obj.get("attributes", {}).get("name", "unknown")
 
                     mint = base_token.get("address", "")
                     if not mint or mint in BURN_ADDRESSES:
                         continue
 
-                    # Parse volume
                     volume_usd = attrs.get("volume_usd", {})
-                    # Parse price changes
-                    price_pct = attrs.get("price_change_percentage", {})
-                    # Parse pool created time
+                    price_pct  = attrs.get("price_change_percentage", {})
+
                     created_at_str = attrs.get("pool_created_at")
-                    created_at = None
-                    age_hours = 9999.0
+                    created_at     = None
+                    age_hours      = 9999.0
                     if created_at_str:
                         try:
                             created_at = datetime.fromisoformat(
@@ -274,58 +385,49 @@ class TokenScout:
                         except Exception:
                             pass
 
-                    pools.append(
-                        {
-                            "mint": mint,
-                            "name": base_token.get("name", "Unknown"),
-                            "symbol": base_token.get("symbol", "???"),
-                            "pool_address": attrs.get("address", ""),
-                            "dex": dex_name,
-                            "price_usd": float(attrs.get("base_token_price_usd") or 0),
-                            "market_cap_usd": float(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or 0),
-                            "fdv_usd": float(attrs.get("fdv_usd") or 0),
-                            "liquidity_usd": float(attrs.get("reserve_in_usd") or 0),
-                            "volume_24h_usd": float(volume_usd.get("h24") or 0),
-                            "volume_6h_usd": float(volume_usd.get("h6") or 0),
-                            "volume_1h_usd": float(volume_usd.get("h1") or 0),
-                            "price_change_1h": float(price_pct.get("h1") or 0),
-                            "price_change_6h": float(price_pct.get("h6") or 0),
-                            "price_change_24h": float(price_pct.get("h24") or 0),
-                            "launched_at": created_at,
-                            "age_hours": age_hours,
-                        }
-                    )
+                    pools.append({
+                        "mint":             mint,
+                        "name":             base_token.get("name", "Unknown"),
+                        "symbol":           base_token.get("symbol", "???"),
+                        "pool_address":     attrs.get("address", ""),
+                        "dex":              dex_name,
+                        "price_usd":        float(attrs.get("base_token_price_usd") or 0),
+                        "market_cap_usd":   float(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or 0),
+                        "fdv_usd":          float(attrs.get("fdv_usd") or 0),
+                        "liquidity_usd":    float(attrs.get("reserve_in_usd") or 0),
+                        "volume_24h_usd":   float(volume_usd.get("h24") or 0),
+                        "volume_6h_usd":    float(volume_usd.get("h6") or 0),
+                        "volume_1h_usd":    float(volume_usd.get("h1") or 0),
+                        "price_change_1h":  float(price_pct.get("h1") or 0),
+                        "price_change_6h":  float(price_pct.get("h6") or 0),
+                        "price_change_24h": float(price_pct.get("h24") or 0),
+                        "launched_at":      created_at,
+                        "age_hours":        age_hours,
+                    })
                 except Exception as e:
                     logger.debug(f"Error parsing GT pool: {e}")
                     continue
 
-            await asyncio.sleep(0.5)  # be polite to GT
+            await asyncio.sleep(0.5)
 
         logger.info(f"[Scout] GeckoTerminal returned {len(pools)} raw pools")
         return pools
 
-    # ── Source 2: DexScreener boosted / trending ───────────────────────────────
+    # ── Source 3: DexScreener boosted / trending ───────────────────────────────
 
     async def _fetch_dexscreener_trending(self) -> list[dict]:
-        """
-        Fetch trending Solana pairs from DexScreener.
-        Uses the token-boosts and latest-boosted endpoint.
-        Free, no key needed.
-        """
         session = await self._get_session()
         results = []
 
-        # Endpoint: latest boosted tokens
-        url = f"{DEXSCREENER_BASE}/token-boosts/latest/v1"
+        url  = f"{DEXSCREENER_BASE}/token-boosts/latest/v1"
         data = await _get_json(session, url)
         if data and isinstance(data, list):
             solana_tokens = [
                 t for t in data if t.get("chainId", "").lower() == "solana"
             ]
-            # Fetch pair data for each token address
             addrs = [t["tokenAddress"] for t in solana_tokens[:20] if t.get("tokenAddress")]
             if addrs:
-                chunk = ",".join(addrs[:10])  # DexScreener allows up to 30
+                chunk      = ",".join(addrs[:10])
                 detail_url = f"{DEXSCREENER_BASE}/latest/dex/tokens/{chunk}"
                 detail_data = await _get_json(session, detail_url)
                 if detail_data:
@@ -341,17 +443,18 @@ class TokenScout:
         return results
 
     async def fetch_token_details_dexscreener(self, mint: str) -> dict | None:
-        """Fetch current data for a specific mint from DexScreener."""
         session = await self._get_session()
-        url = f"{DEXSCREENER_BASE}/latest/dex/tokens/{mint}"
-        data = await _get_json(session, url)
+        url     = f"{DEXSCREENER_BASE}/latest/dex/tokens/{mint}"
+        data    = await _get_json(session, url)
         if not data:
             return None
         pairs = data.get("pairs") or []
         if not pairs:
             return None
-        # Return the pair with highest liquidity
-        pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+        pairs.sort(
+            key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+            reverse=True
+        )
         return self._parse_dexscreener_pair(pairs[0])
 
     def _parse_dexscreener_pair(self, pair: dict) -> dict | None:
@@ -361,23 +464,23 @@ class TokenScout:
             if not mint:
                 return None
 
-            liquidity = pair.get("liquidity") or {}
-            volume = pair.get("volume") or {}
+            liquidity    = pair.get("liquidity") or {}
+            volume       = pair.get("volume") or {}
             price_change = pair.get("priceChange") or {}
 
             created_at = None
-            age_hours = 9999.0
+            age_hours  = 9999.0
             pair_created_at = pair.get("pairCreatedAt")
             if pair_created_at:
                 try:
-                    ts = int(pair_created_at) / 1000  # ms -> s
+                    ts         = int(pair_created_at) / 1000
                     created_at = datetime.fromtimestamp(ts, tz=timezone.utc)
-                    age_hours = (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
+                    age_hours  = (
+                        datetime.now(timezone.utc) - created_at
+                    ).total_seconds() / 3600
                 except Exception:
                     pass
 
-            # DexScreener Enhanced listing — dev paid for visibility boost
-            # Shows as "boosts" field or non-empty "info" with links/description
             info     = pair.get("info") or {}
             boosts   = pair.get("boosts") or {}
             dex_paid = bool(
@@ -388,25 +491,25 @@ class TokenScout:
             )
 
             return {
-                "mint": mint,
-                "name": base.get("name", "Unknown"),
-                "symbol": base.get("symbol", "???"),
-                "pool_address": pair.get("pairAddress", ""),
-                "dex": pair.get("dexId", "unknown"),
-                "price_usd": float(pair.get("priceUsd") or 0),
-                "market_cap_usd": float(pair.get("marketCap") or pair.get("fdv") or 0),
-                "fdv_usd": float(pair.get("fdv") or 0),
-                "liquidity_usd": float(liquidity.get("usd") or 0),
-                "volume_24h_usd": float(volume.get("h24") or 0),
-                "volume_6h_usd": float(volume.get("h6") or 0),
-                "volume_1h_usd": float(volume.get("h1") or 0),
-                "price_change_1h": float(price_change.get("h1") or 0),
-                "price_change_6h": float(price_change.get("h6") or 0),
+                "mint":             mint,
+                "name":             base.get("name", "Unknown"),
+                "symbol":           base.get("symbol", "???"),
+                "pool_address":     pair.get("pairAddress", ""),
+                "dex":              pair.get("dexId", "unknown"),
+                "price_usd":        float(pair.get("priceUsd") or 0),
+                "market_cap_usd":   float(pair.get("marketCap") or pair.get("fdv") or 0),
+                "fdv_usd":          float(pair.get("fdv") or 0),
+                "liquidity_usd":    float(liquidity.get("usd") or 0),
+                "volume_24h_usd":   float(volume.get("h24") or 0),
+                "volume_6h_usd":    float(volume.get("h6") or 0),
+                "volume_1h_usd":    float(volume.get("h1") or 0),
+                "price_change_1h":  float(price_change.get("h1") or 0),
+                "price_change_6h":  float(price_change.get("h6") or 0),
                 "price_change_24h": float(price_change.get("h24") or 0),
-                "launched_at": created_at,
-                "age_hours": age_hours,
-                "dex_paid": dex_paid,
-                "txns_24h": int(
+                "launched_at":      created_at,
+                "age_hours":        age_hours,
+                "dex_paid":         dex_paid,
+                "txns_24h":         int(
                     (pair.get("txns") or {}).get("h24", {}).get("buys", 0)
                     + (pair.get("txns") or {}).get("h24", {}).get("sells", 0)
                 ),
@@ -415,22 +518,22 @@ class TokenScout:
             logger.debug(f"Error parsing DexScreener pair: {e}")
             return None
 
-    # ── Source 3: Birdeye trending (if API key set) ────────────────────────────
+    # ── Source 4: Birdeye trending ─────────────────────────────────────────────
 
     async def _fetch_birdeye_trending(self) -> list[dict]:
         if not config.has_birdeye:
             return []
 
         session = await self._get_session()
-        url = f"{BIRDEYE_BASE}/defi/tokenlist"
-        params = {
-            "sort_by": "v24hChangePercent",
-            "sort_type": "desc",
-            "offset": 0,
-            "limit": 50,
+        url     = f"{BIRDEYE_BASE}/defi/tokenlist"
+        params  = {
+            "sort_by":       "v24hChangePercent",
+            "sort_type":     "desc",
+            "offset":        0,
+            "limit":         50,
             "min_liquidity": config.MIN_LIQUIDITY_USD,
         }
-        data = await _get_json(session, url, headers=HEADERS_BIRDEYE, params=params)
+        data    = await _get_json(session, url, headers=HEADERS_BIRDEYE, params=params)
         results = []
         if data:
             tokens = (data.get("data") or {}).get("tokens") or []
@@ -438,27 +541,25 @@ class TokenScout:
                 mint = t.get("address", "")
                 if not mint:
                     continue
-                results.append(
-                    {
-                        "mint": mint,
-                        "name": t.get("name", "Unknown"),
-                        "symbol": t.get("symbol", "???"),
-                        "pool_address": "",
-                        "dex": "birdeye",
-                        "price_usd": float(t.get("price") or 0),
-                        "market_cap_usd": float(t.get("mc") or 0),
-                        "fdv_usd": float(t.get("fdv") or 0),
-                        "liquidity_usd": float(t.get("liquidity") or 0),
-                        "volume_24h_usd": float(t.get("v24hUSD") or 0),
-                        "volume_6h_usd": float(t.get("v6hUSD") or 0),
-                        "volume_1h_usd": float(t.get("v1hUSD") or 0),
-                        "price_change_1h": float(t.get("v1hChangePercent") or 0),
-                        "price_change_6h": float(t.get("v6hChangePercent") or 0),
-                        "price_change_24h": float(t.get("v24hChangePercent") or 0),
-                        "launched_at": None,
-                        "age_hours": 9999.0,
-                    }
-                )
+                results.append({
+                    "mint":             mint,
+                    "name":             t.get("name", "Unknown"),
+                    "symbol":           t.get("symbol", "???"),
+                    "pool_address":     "",
+                    "dex":              "birdeye",
+                    "price_usd":        float(t.get("price") or 0),
+                    "market_cap_usd":   float(t.get("mc") or 0),
+                    "fdv_usd":          float(t.get("fdv") or 0),
+                    "liquidity_usd":    float(t.get("liquidity") or 0),
+                    "volume_24h_usd":   float(t.get("v24hUSD") or 0),
+                    "volume_6h_usd":    float(t.get("v6hUSD") or 0),
+                    "volume_1h_usd":    float(t.get("v1hUSD") or 0),
+                    "price_change_1h":  float(t.get("v1hChangePercent") or 0),
+                    "price_change_6h":  float(t.get("v6hChangePercent") or 0),
+                    "price_change_24h": float(t.get("v24hChangePercent") or 0),
+                    "launched_at":      None,
+                    "age_hours":        9999.0,
+                })
         logger.info(f"[Scout] Birdeye trending returned {len(results)} tokens")
         return results
 
@@ -467,30 +568,40 @@ class TokenScout:
     def _meets_thresholds(self, t: dict) -> tuple[bool, str]:
         """
         Hard gate. Returns (passes, reason_if_failed).
-        These are non-negotiable — if a token fails here it is dropped permanently.
+        pump.fun tokens are exempt from volume and price-change checks
+        because that data isn't available until the token is indexed by DEX aggregators.
         """
-        liq = t.get("liquidity_usd", 0)
-        vol = t.get("volume_24h_usd", 0)
-        mc = t.get("market_cap_usd", 0)
-        age = t.get("age_hours", 9999)
-        p1h = t.get("price_change_1h", 0)
+        liq    = t.get("liquidity_usd", 0)
+        vol    = t.get("volume_24h_usd", 0)
+        mc     = t.get("market_cap_usd", 0)
+        age    = t.get("age_hours", 9999)
+        p1h    = t.get("price_change_1h", 0)
+        source = t.get("source", "")
+        is_pumpfun = source == "pumpfun"
 
-        if liq < config.MIN_LIQUIDITY_USD:
-            return False, f"liquidity ${liq:,.0f} < min ${config.MIN_LIQUIDITY_USD:,.0f}"
-        if vol < config.MIN_VOLUME_24H_USD:
+        # Liquidity: relax the floor for pump.fun tokens (estimated value)
+        liq_min = config.MIN_LIQUIDITY_USD * 0.3 if is_pumpfun else config.MIN_LIQUIDITY_USD
+        if liq < liq_min:
+            return False, f"liquidity ${liq:,.0f} < min ${liq_min:,.0f}"
+
+        # Volume: skip for pump.fun (bonding curve doesn't report standard volume)
+        if not is_pumpfun and vol < config.MIN_VOLUME_24H_USD:
             return False, f"volume ${vol:,.0f} < min ${config.MIN_VOLUME_24H_USD:,.0f}"
+
         if mc < config.MIN_MARKET_CAP_USD:
             return False, f"mcap ${mc:,.0f} < min ${config.MIN_MARKET_CAP_USD:,.0f}"
         if mc > config.MAX_MARKET_CAP_USD:
             return False, f"mcap ${mc:,.0f} > max ${config.MAX_MARKET_CAP_USD:,.0f}"
         if age > config.MAX_TOKEN_AGE_HOURS:
             return False, f"age {age:.1f}h > max {config.MAX_TOKEN_AGE_HOURS}h"
-        if p1h < config.MIN_PRICE_CHANGE_1H:
+
+        # Price change: skip for pump.fun (no historical price from bonding curve API)
+        if not is_pumpfun and p1h < config.MIN_PRICE_CHANGE_1H:
             return False, f"1h price change {p1h:.1f}% < min {config.MIN_PRICE_CHANGE_1H}%"
+
         return True, ""
 
     def _is_on_cooldown(self, mint: str) -> bool:
-        """Don't re-alert the same token within ALERT_COOLDOWN_HOURS."""
         last = self._seen_mints.get(mint, 0)
         return (time.time() - last) < config.ALERT_COOLDOWN_HOURS * 3600
 
@@ -500,8 +611,7 @@ class TokenScout:
 
     def _save_seen_mints(self):
         try:
-            # Only save mints that are still within cooldown window
-            now = time.time()
+            now    = time.time()
             active = {
                 m: t for m, t in self._seen_mints.items()
                 if now - t < config.ALERT_COOLDOWN_HOURS * 3600
@@ -520,31 +630,37 @@ class TokenScout:
             with open(SEEN_MINTS_FILE) as f:
                 data = json.load(f)
             now = time.time()
-            # Only load mints still within cooldown
             self._seen_mints = {
                 m: t for m, t in data.items()
                 if now - t < config.ALERT_COOLDOWN_HOURS * 3600
             }
             if self._seen_mints:
-                logger.info(
-                    f"[Scout] Loaded {len(self._seen_mints)} cooldown mints from disk"
-                )
+                logger.info(f"[Scout] Loaded {len(self._seen_mints)} cooldown mints from disk")
         except Exception as e:
             logger.debug(f"[Scout] Could not load seen mints: {e}")
 
-    # ── Dedup ──────────────────────────────────────────────────────────────────
-
     def _dedup(self, raw_list: list[dict]) -> list[dict]:
-        """Merge duplicate mints, keeping the entry with more data."""
+        """
+        Merge duplicate mints. If the same mint appears from both pump.fun and
+        DexScreener, prefer the DexScreener entry (has real volume/price data).
+        """
         seen: dict[str, dict] = {}
         for t in raw_list:
             mint = t.get("mint", "")
             if not mint:
                 continue
-            if mint not in seen or (
-                t.get("liquidity_usd", 0) > seen[mint].get("liquidity_usd", 0)
-            ):
+            if mint not in seen:
                 seen[mint] = t
+            else:
+                existing = seen[mint]
+                # Prefer entry with real volume data over pump.fun estimate
+                if t.get("source") != "pumpfun" and existing.get("source") == "pumpfun":
+                    # Merge: keep DexScreener data but carry pump.fun extras
+                    t["pumpfun_reply_count"] = existing.get("pumpfun_reply_count", 0)
+                    t["pumpfun_is_koth"]     = existing.get("pumpfun_is_koth", False)
+                    seen[mint] = t
+                elif t.get("liquidity_usd", 0) > existing.get("liquidity_usd", 0):
+                    seen[mint] = t
         return list(seen.values())
 
     # ── Main scan ──────────────────────────────────────────────────────────────
@@ -556,17 +672,18 @@ class TokenScout:
         """
         logger.info("[Scout] Starting scan cycle…")
 
-        # Gather from all sources in parallel
+        # Gather from all sources in parallel — pump.fun is first/primary
+        pump_task  = asyncio.create_task(self._fetch_pumpfun_new())
         gecko_task = asyncio.create_task(self._fetch_gecko_new_pools())
-        dex_task = asyncio.create_task(self._fetch_dexscreener_trending())
-        bird_task = asyncio.create_task(self._fetch_birdeye_trending())
+        dex_task   = asyncio.create_task(self._fetch_dexscreener_trending())
+        bird_task  = asyncio.create_task(self._fetch_birdeye_trending())
 
-        gecko_results, dex_results, bird_results = await asyncio.gather(
-            gecko_task, dex_task, bird_task, return_exceptions=True
+        pump_results, gecko_results, dex_results, bird_results = await asyncio.gather(
+            pump_task, gecko_task, dex_task, bird_task, return_exceptions=True
         )
 
         raw: list[dict] = []
-        for result in [gecko_results, dex_results, bird_results]:
+        for result in [pump_results, gecko_results, dex_results, bird_results]:
             if isinstance(result, list):
                 raw.extend(result)
             elif isinstance(result, Exception):
@@ -586,7 +703,7 @@ class TokenScout:
                 logger.debug(f"[Scout] {t.get('symbol')} dropped: {reason}")
                 continue
 
-            # Check for duplicate ticker (copycat token warning)
+            # Copycat detection
             ticker_upper = t["symbol"].upper()
             if ticker_upper in self._seen_tickers and self._seen_tickers[ticker_upper] != mint:
                 logger.info(
@@ -594,16 +711,12 @@ class TokenScout:
                     f"first CA={self._seen_tickers[ticker_upper][:8]}, "
                     f"this CA={mint[:8]} — flagging as copycat"
                 )
-                # Still surface it but mark as possible copycat
                 t["possible_copycat"] = True
-                t["original_ca"] = self._seen_tickers[ticker_upper]
+                t["original_ca"]      = self._seen_tickers[ticker_upper]
             else:
                 self._seen_tickers[ticker_upper] = mint
 
-            # Record for narrative detection
-            narrative_tracker.record_token(
-                t.get("name", ""), t.get("symbol", ""), passed=True
-            )
+            narrative_tracker.record_token(t.get("name", ""), t.get("symbol", ""), passed=True)
 
             opp = TokenOpportunity(
                 mint=mint,
@@ -627,6 +740,8 @@ class TokenScout:
                 original_ca=t.get("original_ca", ""),
                 dex_paid=t.get("dex_paid", False),
                 txns_24h=t.get("txns_24h", 0),
+                pumpfun_reply_count=t.get("pumpfun_reply_count", 0),
+                pumpfun_is_koth=t.get("pumpfun_is_koth", False),
             )
             opportunities.append(opp)
 
