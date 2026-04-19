@@ -774,6 +774,11 @@ async def cmd_walletbalances(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
+
+async def cmd_walletbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Backward-compatible alias for the pluralized command."""
+    await cmd_walletbalances(update, context)
+
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         return await _unauthorized(update, context)
@@ -865,29 +870,31 @@ async def _run_scan_cycle(
                 # Annotate notable account attr for briefing
                 opp.has_notable_account = sentiment_result.has_notable_account
 
-                # Social signal gate
+                # Social signal gate — relaxed for young tokens
                 if not sentiment_result.has_any_signal:
-                    # Check if on-chain data is exceptional enough to justify surfacing
                     vol_liq = opp.volume_24h_usd / opp.liquidity_usd if opp.liquidity_usd > 0 else 0
+                    # Young tokens (<2h) rarely have social signal yet — don't penalise them
+                    is_young = opp.age_hours < 2.0
                     is_exceptional = (
-                        opp.price_change_1h >= 100
-                        and vol_liq >= 3
-                        and opp.liquidity_usd >= config.MIN_LIQUIDITY_USD * 3
+                        opp.price_change_1h >= 20          # lowered from 100%
+                        and vol_liq >= 1.5                 # lowered from 3x
+                        and opp.liquidity_usd >= config.MIN_LIQUIDITY_USD
                     )
-                    if is_exceptional:
+                    if is_young or is_exceptional:
                         opp.data_only_call = True
                         opp.data_only_reason = (
-                            f"{opp.price_change_1h:.0f}% 1h move, "
-                            f"{vol_liq:.1f}x vol/liq ratio, no social data found"
+                            f"{'Young token ' + opp.age_str + ', ' if is_young else ''}"
+                            f"{opp.price_change_1h:.0f}% 1h, "
+                            f"{vol_liq:.1f}x vol/liq — no social data yet"
                         )
                         logger.info(
-                            f"[Bot] {opp.symbol} has no social signal but exceptional "
-                            f"on-chain data — surfacing as DATA-ONLY call"
+                            f"[Bot] {opp.symbol} — no social signal, surfacing as "
+                            f"DATA-ONLY ({'young' if is_young else 'exceptional on-chain'})"
                         )
                     else:
                         logger.info(
-                            f"[Bot] {opp.symbol} skipped — no social signal and "
-                            f"on-chain data not exceptional enough"
+                            f"[Bot] {opp.symbol} skipped — no social signal, "
+                            f"on-chain not strong enough"
                         )
                         continue
 
@@ -1170,6 +1177,7 @@ def main():
             ("positions",    "Open positions"),
             ("balance",      "SOL wallet balance"),
             ("wallets",      "List tracked wallets"),
+            ("walletbalances", "Tracked wallet balances"),
             ("addwallet",    "Add wallet to track"),
             ("removewallet", "Remove tracked wallet"),
             ("stop",         "Pause auto-scanning"),
@@ -1205,6 +1213,7 @@ def main():
     app.add_handler(CommandHandler("removewallet", cmd_removewallet))
     app.add_handler(CommandHandler("wallets", cmd_wallets))
     app.add_handler(CommandHandler("walletbalances", cmd_walletbalances))
+    app.add_handler(CommandHandler("walletbalance", cmd_walletbalance))
 
     # Inline keyboard callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))

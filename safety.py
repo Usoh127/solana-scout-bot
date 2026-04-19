@@ -12,8 +12,11 @@ Checks in order of reliability:
 A token passes safety if:
   - No dangerous SPL-2022 extensions
   - Freeze authority renounced
-  - Mint authority renounced
   - Top-10 holder concentration < MAX_TOP_10_HOLDER_PCT
+
+NOTE: Mint authority NOT renounced is now a warning/penalty only, not a hard fail.
+Most early pump.fun tokens haven't renounced yet — killing them here was the reason
+the bot never fired a single alert.
 """
 
 from __future__ import annotations
@@ -74,7 +77,7 @@ class SafetyResult:
     fake_volume_detail:        str = ""
     deployer_risk:             float = 0.0
     deployer_detail:           str = ""
-    deployer_address:          str  = ""   # full deployer wallet address
+    deployer_address:          str  = ""
 
 
 class SafetyChecker:
@@ -156,20 +159,9 @@ class SafetyChecker:
     async def _check_lp_burned(
         self, pool_address: str, mint: str = "", dex_name: str = ""
     ) -> Optional[bool]:
-        """
-        Check if LP tokens are burned.
-
-        Strategy:
-        1. For PumpSwap tokens — query DexScreener pair data which explicitly
-           reports LP burn status. PumpSwap migrations from pump.fun always
-           burn LP, but custom pools don't.
-        2. For other DEXes — check if pool account is owned by burn address.
-        3. Return None if we genuinely cannot determine.
-        """
         dex_lower = (dex_name or "").lower()
         is_pumpswap = "pump" in dex_lower
 
-        # For PumpSwap tokens, DexScreener tells us LP burn status directly
         if is_pumpswap and mint:
             try:
                 session = await self._get_session()
@@ -180,16 +172,14 @@ class SafetyChecker:
                     if resp.status == 200:
                         data  = await resp.json(content_type=None)
                         pairs = data.get("pairs") or []
-                        # Find the PumpSwap pair specifically
                         pump_pairs = [
                             p for p in pairs
                             if "pump" in (p.get("dexId") or "").lower()
                         ]
                         if not pump_pairs:
-                            pump_pairs = pairs  # fallback to any pair
+                            pump_pairs = pairs
 
                         if pump_pairs:
-                            # Sort by liquidity to get primary pair
                             pump_pairs.sort(
                                 key=lambda p: float(
                                     (p.get("liquidity") or {}).get("usd") or 0
@@ -197,27 +187,17 @@ class SafetyChecker:
                                 reverse=True,
                             )
                             pair = pump_pairs[0]
-                            liq  = pair.get("liquidity") or {}
-
-                            # DexScreener reports lpBurn as percentage 0-100
-                            # Some versions use "lpBurn", some have it in pair info
                             lp_burn = pair.get("lpBurn")
                             if lp_burn is not None:
-                                burned = int(lp_burn) >= 90  # 90%+ = effectively burned
+                                burned = int(lp_burn) >= 90
                                 logger.debug(
                                     f"[Safety] {mint[:8]}: DexScreener lpBurn={lp_burn}% "
                                     f"→ {'burned' if burned else 'NOT burned'}"
                                 )
                                 return burned
 
-                            # Alternative: check if pair info indicates migration
-                            pair_info = pair.get("info") or {}
-                            # pump.fun migrated pairs have liquidity locked
-                            # Check if pool address matches known pump migration
                             dex_id = (pair.get("dexId") or "").lower()
                             if "pump" in dex_id:
-                                # pump.fun to PumpSwap migration burns LP by default
-                                # Only unsafe if manually created (custom pool)
                                 logger.debug(
                                     f"[Safety] {mint[:8]}: PumpSwap pair — "
                                     f"assuming LP burned (pump.fun migration)"
@@ -227,7 +207,6 @@ class SafetyChecker:
             except Exception as e:
                 logger.debug(f"[Safety] DexScreener LP check error: {e}")
 
-        # Fallback: check if pool account is owned by burn address
         if not pool_address:
             return None
         result = await self._rpc_call(
@@ -241,12 +220,6 @@ class SafetyChecker:
             return None
 
     async def _check_token_extensions(self, mint: str) -> tuple[str, list[str]]:
-        """
-        Detect dangerous SPL-Token-2022 extensions.
-        Returns (token_program, list_of_dangerous_extensions_found).
-        spl-token has no extensions and is always safe.
-        spl-token-2022 with dangerous extensions is an instant fail.
-        """
         result = await self._rpc_call(
             "getAccountInfo", [mint, {"encoding": "jsonParsed"}]
         )
@@ -294,10 +267,6 @@ class SafetyChecker:
     async def _check_pool_safety(
         self, pool_address: str, dex_name: str
     ) -> tuple[str, float, list[str]]:
-        """
-        Check pool fee rate and DEX type.
-        Returns (pool_creator, fee_rate, warnings).
-        """
         if not pool_address:
             return "unknown", 0.0, []
 
@@ -355,6 +324,7 @@ class SafetyChecker:
         red_flags    = []
         instant_fail = False
 
+        # ── Hard fails (instant kill regardless of other signals) ──────────────
         if dangerous_extensions:
             for ext in dangerous_extensions:
                 red_flags.append(f"🚨 DANGEROUS EXTENSION: {ext}")
@@ -364,10 +334,15 @@ class SafetyChecker:
             red_flags.append("🚨 Freeze authority ACTIVE — can freeze your tokens")
             instant_fail = True
 
+        # ── Soft warnings (contribute to red flag count, not instant fails) ────
+        # Mint not renounced is now a WARNING only — many early legit tokens
+        # haven't renounced yet. It shows in the briefing for your awareness.
         if not mint_renounced:
             red_flags.append("⚠️ Mint authority NOT renounced (infinite mint risk)")
+
         if top10_pct > config.MAX_TOP_10_HOLDER_PCT:
             red_flags.append(f"⚠️ Top-10 holders own {top10_pct:.1f}% (dump risk)")
+
         if lp_burned is False:
             red_flags.append("⚠️ LP not burned/locked (rug vector open)")
 
@@ -380,31 +355,19 @@ class SafetyChecker:
             if not birdeye_data.get("lpBurned") and lp_burned is None:
                 red_flags.append("⚠️ LP not burned (Birdeye)")
 
-        return instant_fail or len(red_flags) >= 2, red_flags
+        # Require 3+ soft flags to fail (was 2) — prevents a single "mint not
+        # renounced" + one other minor flag from killing every early token
+        return instant_fail or len(red_flags) >= 3, red_flags
 
-    # ── Deployer wallet history check ────────────────────────────────────────────
+    # ── Deployer wallet history check ─────────────────────────────────────────
 
-    async def _check_deployer_history(
-        self, mint: str
-    ) -> tuple[float, str]:
-        """
-        Check if the token deployer has a history of rugging.
-
-        Method:
-        1. Fetch the token's creation transaction via Helius to get deployer address
-        2. Fetch the last 10 tokens deployed by the same wallet
-        3. Flag if deployer has pattern of quick liquidity pulls / abandoned tokens
-
-        Returns (rug_risk_score, description)
-        0.0 = clean or unknown, 1.0 = known rugger
-        """
+    async def _check_deployer_history(self, mint: str) -> tuple[float, str]:
         if not config.has_helius:
             return 0.0, "", ""
 
         session = await self._get_session()
-
-        # Step 1: Get token creation tx to find deployer
         deployer = None
+
         try:
             url = f"https://api.helius.xyz/v0/addresses/{mint}/transactions"
             params = {
@@ -419,13 +382,11 @@ class SafetyChecker:
                 if resp.status == 200:
                     txns = await resp.json(content_type=None)
                     if isinstance(txns, list) and txns:
-                        # Creator is the fee payer on the mint transaction
                         deployer = txns[-1].get("feePayer") or txns[0].get("feePayer")
         except Exception as e:
             logger.debug(f"[Safety] Deployer fetch error: {e}")
 
         if not deployer:
-            # Fallback: get from first token mint via RPC
             try:
                 result = await self._rpc_call(
                     "getSignaturesForAddress",
@@ -453,7 +414,6 @@ class SafetyChecker:
 
         logger.debug(f"[Safety] Deployer for {mint[:8]}: {deployer[:8]}...")
 
-        # Step 2: Check deployer's recent token creations
         try:
             url = f"https://api.helius.xyz/v0/addresses/{deployer}/transactions"
             params = {
@@ -475,26 +435,17 @@ class SafetyChecker:
         if not isinstance(recent_txns, list):
             return 0.0, f"Deployer: {deployer[:8]}...", deployer
 
-        # Count how many tokens this wallet has deployed
         tokens_deployed = len(recent_txns)
-
-        # Step 3: Check token launch frequency
-        # Serial deployers (5+ tokens in recent history) are higher risk
         flags   = []
         risk    = 0.0
 
         if tokens_deployed >= 10:
             risk += 0.5
-            flags.append(
-                f"deployer launched {tokens_deployed}+ tokens recently (serial deployer)"
-            )
+            flags.append(f"deployer launched {tokens_deployed}+ tokens recently (serial deployer)")
         elif tokens_deployed >= 5:
             risk += 0.25
-            flags.append(
-                f"deployer launched {tokens_deployed} tokens recently"
-            )
+            flags.append(f"deployer launched {tokens_deployed} tokens recently")
 
-        # Check timing — if multiple tokens deployed very close together
         if tokens_deployed >= 3:
             timestamps = [
                 tx.get("timestamp", 0)
@@ -503,7 +454,6 @@ class SafetyChecker:
             ]
             if len(timestamps) >= 3:
                 timestamps.sort(reverse=True)
-                # Time between first and third most recent deploy
                 time_span_hours = (timestamps[0] - timestamps[2]) / 3600
                 if time_span_hours < 24:
                     risk += 0.3
@@ -517,45 +467,23 @@ class SafetyChecker:
             desc += ": " + " | ".join(flags)
             logger.info(f"[Safety] Deployer check: {desc} (risk={risk:.2f})")
 
-        return risk, desc, deployer   # third element = full address
+        return risk, desc, deployer
 
-    # ── Fake volume detection ────────────────────────────────────────────────────
+    # ── Fake volume detection ──────────────────────────────────────────────────
 
     def _check_fake_volume(
         self, volume_24h: float, liquidity: float, txns_24h: int
     ) -> tuple[float, str]:
-        """
-        Detect fake/wash-traded volume using two signals validated by experienced traders:
-
-        Signal 1 — Volume/Liquidity ratio
-            Natural markets: vol/liq typically 2x-20x
-            Wash trading: vol/liq can be 100x+ (same SOL looping)
-            Guide reference: "If volume is extremely high but liquidity is low,
-            something is off. Natural markets cannot sustain heavy volume
-            without liquidity."
-
-        Signal 2 — Average trade size
-            Real organic trading = many small/medium trades
-            Wash trading = few huge trades OR bot-perfect identical sizes
-            We proxy this as: avg_trade = volume_24h / txns_24h
-            If avg trade > 5% of liquidity = suspicious (few large trades)
-
-        Returns (fake_vol_risk, description)
-        0.0 = clean, 1.0 = very likely fake
-        """
         if volume_24h <= 0 or liquidity <= 0:
             return 0.0, ""
 
         flags = []
         risk  = 0.0
 
-        # Signal 1: vol/liq ratio
         vol_liq = volume_24h / liquidity
         if vol_liq > 100:
             risk += 0.6
-            flags.append(
-                f"vol/liq ratio {vol_liq:.0f}x — extreme (likely wash trading)"
-            )
+            flags.append(f"vol/liq ratio {vol_liq:.0f}x — extreme (likely wash trading)")
         elif vol_liq > 50:
             risk += 0.3
             flags.append(f"vol/liq ratio {vol_liq:.0f}x — suspicious")
@@ -563,7 +491,6 @@ class SafetyChecker:
             risk += 0.1
             flags.append(f"vol/liq ratio {vol_liq:.0f}x — elevated")
 
-        # Signal 2: average trade size vs liquidity
         if txns_24h > 0:
             avg_trade = volume_24h / txns_24h
             avg_trade_pct = (avg_trade / liquidity) * 100
@@ -575,11 +502,8 @@ class SafetyChecker:
                 )
             elif avg_trade_pct > 10:
                 risk += 0.2
-                flags.append(
-                    f"avg trade is {avg_trade_pct:.0f}% of liquidity — suspicious"
-                )
+                flags.append(f"avg trade is {avg_trade_pct:.0f}% of liquidity — suspicious")
         elif volume_24h > 50_000:
-            # High volume but zero transactions reported = data gap / likely fake
             risk += 0.3
             flags.append("high volume but no transaction count data")
 
@@ -587,28 +511,13 @@ class SafetyChecker:
         description = " | ".join(flags) if flags else ""
 
         if flags:
-            logger.info(
-                f"[Safety] Fake volume signals: {description} (risk={risk:.2f})"
-            )
+            logger.info(f"[Safety] Fake volume signals: {description} (risk={risk:.2f})")
 
         return risk, description
 
-    # ── Bundle detection ──────────────────────────────────────────────────────────
+    # ── Bundle detection ───────────────────────────────────────────────────────
 
-    async def _check_bundle(
-        self, mint: str
-    ) -> tuple[float, str]:
-        """
-        Detect coordinated/bundled launches by analyzing early buyers.
-
-        Checks:
-        1. Same-slot buys: multiple wallets buying in exact same block = coordinated
-        2. Early buyer concentration: first 20 buys holding >50% of supply = risky
-        3. Common funding: early wallets funded from same source (simplified check)
-
-        Returns (bundle_risk_score, description)
-        score: 0.0 = clean, 1.0 = highly likely bundled
-        """
+    async def _check_bundle(self, mint: str) -> tuple[float, str]:
         if not config.has_helius:
             return 0.0, ""
 
@@ -617,7 +526,7 @@ class SafetyChecker:
         params = {
             "api-key": config.HELIUS_API_KEY,
             "type":    "SWAP",
-            "limit":   20,  # First 20 swap transactions
+            "limit":   20,
         }
 
         try:
@@ -630,14 +539,12 @@ class SafetyChecker:
                 txns = await resp.json(content_type=None)
                 if not isinstance(txns, list) or not txns:
                     return 0.0, ""
-
         except Exception as e:
             logger.debug(f"[Safety] Bundle check error: {e}")
             return 0.0, ""
 
-        # ── Check 1: Same-slot buys ──────────────────────────────────────────
-        slots: dict[int, list[str]] = {}  # slot -> list of buyer wallets
-        buyer_amounts: dict[str, float] = {}  # wallet -> token amount bought
+        slots: dict[int, list[str]] = {}
+        buyer_amounts: dict[str, float] = {}
 
         for tx in txns:
             slot      = tx.get("slot", 0)
@@ -652,23 +559,16 @@ class SafetyChecker:
                 to_acct = transfer.get("toUserAccount", "")
                 amount  = float(transfer.get("tokenAmount") or 0)
                 if to_acct == fee_payer and amount > 0:
-                    # This wallet bought tokens
                     if slot not in slots:
                         slots[slot] = []
                     if fee_payer not in slots[slot]:
                         slots[slot].append(fee_payer)
-                    buyer_amounts[fee_payer] = (
-                        buyer_amounts.get(fee_payer, 0) + amount
-                    )
+                    buyer_amounts[fee_payer] = buyer_amounts.get(fee_payer, 0) + amount
 
-        # Count wallets buying in same slot
         max_same_slot = max((len(v) for v in slots.values()), default=0)
-
-        # ── Check 2: Early buyer concentration ──────────────────────────────
-        total_bought = sum(buyer_amounts.values())
+        total_bought  = sum(buyer_amounts.values())
         unique_buyers = len(buyer_amounts)
 
-        # Risk flags
         flags = []
         risk  = 0.0
 
@@ -680,18 +580,14 @@ class SafetyChecker:
             flags.append(f"{max_same_slot} wallets in same slot (mild coordination)")
 
         if unique_buyers > 0 and unique_buyers <= 5 and total_bought > 0:
-            # Very few early buyers — high concentration risk
             risk += 0.3
             flags.append(f"Only {unique_buyers} unique early buyers")
 
-        # Check if one wallet dominates early buys
         if total_bought > 0 and buyer_amounts:
             largest_buyer_pct = max(buyer_amounts.values()) / total_bought * 100
             if largest_buyer_pct > 50:
                 risk += 0.3
-                flags.append(
-                    f"Single wallet holds {largest_buyer_pct:.0f}% of early buys"
-                )
+                flags.append(f"Single wallet holds {largest_buyer_pct:.0f}% of early buys")
 
         risk = min(risk, 1.0)
 
@@ -708,7 +604,6 @@ class SafetyChecker:
         volume_24h: float = 0.0, liquidity: float = 0.0, txns_24h: int = 0
     ) -> SafetyResult:
         logger.info(f"[Safety] Running checks for {mint}")
-        # Store passed-in market data for fake volume check
         opp_volume_24h = volume_24h
         opp_liquidity  = liquidity
         opp_txns_24h   = txns_24h
@@ -756,22 +651,18 @@ class SafetyChecker:
             if birdeye_data.get("lpBurned") is not None:
                 lp_burned = birdeye_data["lpBurned"]
 
-        # Add bundle detection to pool warnings
         if bundle_risk >= 0.5 and bundle_desc:
             pool_warnings.append(f"🚨 HIGH BUNDLE RISK: {bundle_desc}")
         elif bundle_risk >= 0.25 and bundle_desc:
             pool_warnings.append(f"⚠️ Bundle signals detected: {bundle_desc}")
 
-        # Deployer history warnings
         if deployer_risk >= 0.5 and deployer_desc:
             pool_warnings.append(f"🚨 SERIAL DEPLOYER: {deployer_desc}")
         elif deployer_risk >= 0.25 and deployer_desc:
             pool_warnings.append(f"⚠️ {deployer_desc}")
         elif deployer_desc:
-            # Always show deployer address even if clean
             pool_warnings.append(f"ℹ️ {deployer_desc}")
 
-        # Fake volume check (synchronous — uses data already available)
         fake_vol_risk, fake_vol_desc = self._check_fake_volume(
             opp_volume_24h, opp_liquidity, opp_txns_24h
         )
@@ -794,7 +685,7 @@ class SafetyChecker:
         elif token_program == "spl-token":
             checks.append("✅ SPL-Token (standard)")
 
-        checks.append("✅ Mint authority renounced" if mint_renounced else "❌ Mint NOT renounced")
+        checks.append("✅ Mint authority renounced" if mint_renounced else "⚠️ Mint NOT renounced (warning)")
         checks.append("✅ Freeze authority clear" if freeze_renounced else "🚨 Freeze authority ACTIVE")
 
         if top10_pct > 0:
@@ -813,20 +704,19 @@ class SafetyChecker:
         if red_flags:
             summary += "\n\nRed flags:\n" + "\n".join(red_flags)
 
-        final_passed = not is_honeypot and mint_renounced
+        # ── FIXED: mint_renounced is no longer a hard requirement ─────────────
+        # Only freeze authority active and dangerous extensions are instant kills.
+        # Mint not renounced is surfaced as a warning in the briefing instead.
+        final_passed = not is_honeypot
         if not final_passed:
             reasons = []
-            if not mint_renounced:
-                reasons.append("mint not renounced")
             if dangerous_extensions:
                 reasons.append(f"dangerous extensions: {len(dangerous_extensions)}")
             if not freeze_renounced:
                 reasons.append("freeze authority active")
             if is_honeypot and red_flags:
                 reasons.append(f"{len(red_flags)} red flags")
-            logger.info(
-                f"[Safety] {mint[:8]} FAILED: {', '.join(reasons)}"
-            )
+            logger.info(f"[Safety] {mint[:8]} FAILED: {', '.join(reasons)}")
 
         return SafetyResult(
             passed=final_passed,
