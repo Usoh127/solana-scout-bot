@@ -215,11 +215,10 @@ def _format_deployer_line(opp) -> str:
             addr = match.group(1)
     if not addr:
         return ""
-    short = f"{addr[:6]}...{addr[-4:]}"
     return (
         f"👨\u200d💻 Dev: "
         f"<a href=\"https://solscan.io/account/{addr}\">"
-        f"<code>{short}</code></a>\n"
+        f"<code>{addr}</code></a>\n"
     )
 
 
