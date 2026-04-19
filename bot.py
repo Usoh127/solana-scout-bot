@@ -37,6 +37,7 @@ from scout import TokenOpportunity, TokenScout
 from sentiment import SentimentAnalyzer
 from wallet_tracker import WalletTracker, WalletBuyAlert
 from narrative_tracker import narrative_tracker
+from logger import signal_logger
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -910,6 +911,7 @@ async def _run_scan_cycle(
                     reply_markup=keyboard,
                 )
                 scout.mark_alerted(opp.mint)
+                signal_logger.log_alert(opp)
                 briefings_sent += 1
 
                 await asyncio.sleep(0.5)  # avoid hitting Telegram rate limit
@@ -1072,6 +1074,7 @@ async def _handle_confirm_buy(query, context, mint: str):
             volume_at_buy=opp.volume_1h_usd,
         )
         monitor.add_position(position)
+        signal_logger.mark_bought(mint)
         logger.info(f"[Bot] Position opened: {opp.symbol}")
     else:
         await query.edit_message_text(
@@ -1145,6 +1148,65 @@ async def _handle_confirm_sell(query, context, mint: str):
         )
 
 
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /close <CA> <outcome>
+    Examples:
+        /close So1abc123... 3.5x
+        /close So1abc123... rugged
+        /close So1abc123... -40%
+    """
+    if not _is_authorized(update):
+        return await _unauthorized(update, context)
+
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /close &lt;CA&gt; &lt;outcome&gt;\n\n"
+            "Examples:\n"
+            "  /close ABC123 3.5x\n"
+            "  /close ABC123 rugged\n"
+            "  /close ABC123 -40%",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    mint        = args[0].strip()
+    outcome_raw = " ".join(args[1:]).strip()
+
+    success, message = signal_logger.close_trade(mint, outcome_raw)
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /stats          — overall performance
+    /stats sources  — breakdown by data source
+    """
+    if not _is_authorized(update):
+        return await _unauthorized(update, context)
+
+    mode = (context.args[0].lower() if context.args else "overall")
+    text = signal_logger.get_stats(mode)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def _weekly_digest_job(context: ContextTypes.DEFAULT_TYPE):
+    """Fires every Sunday — sends the weekly digest to Telegram."""
+    chat_id = context.bot_data.get("chat_id", config.TELEGRAM_ALLOWED_USER_ID)
+    if not chat_id:
+        return
+    text = signal_logger.get_weekly_digest()
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error(f"[Bot] Weekly digest send error: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
@@ -1181,6 +1243,8 @@ def main():
             ("removewallet", "Remove tracked wallet"),
             ("stop",         "Pause auto-scanning"),
             ("help",         "All commands"),
+            ("close",        "Log trade outcome"),
+            ("stats",        "View signal performance stats"),
         ])
 
     import asyncio as _aio2
@@ -1213,6 +1277,8 @@ def main():
     app.add_handler(CommandHandler("wallets", cmd_wallets))
     app.add_handler(CommandHandler("walletbalances", cmd_walletbalances))
     app.add_handler(CommandHandler("walletbalance", cmd_walletbalance))
+    app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(CommandHandler("stats", cmd_stats))
 
     # Inline keyboard callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -1232,6 +1298,13 @@ def main():
         interval=config.MONITOR_INTERVAL_SECONDS,
         first=60,
         name="position_monitor",
+    )
+    # Weekly digest — fires every Sunday at 9am WAT (8am UTC)
+    jq.run_daily(
+        _weekly_digest_job,
+        time=datetime.strptime("08:00", "%H:%M").time(),
+        days=(6,),   # 6 = Sunday
+        name="weekly_digest",
     )
 
     logger.info(
