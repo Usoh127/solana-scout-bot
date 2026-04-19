@@ -67,13 +67,14 @@ class SafetyResult:
     token_program:             str  = "unknown"
     pool_creator:              str  = "unknown"
     pool_fee_rate:             float = 0.0
-    lp_lock_verified:          bool = False
+    lp_lock_verified:          Optional[bool] = None
     bundle_risk:               float = 0.0
     bundle_detail:             str = ""
     fake_volume_risk:          float = 0.0
     fake_volume_detail:        str = ""
     deployer_risk:             float = 0.0
     deployer_detail:           str = ""
+    deployer_address:          str  = ""   # full deployer wallet address
 
 
 class SafetyChecker:
@@ -398,7 +399,7 @@ class SafetyChecker:
         0.0 = clean or unknown, 1.0 = known rugger
         """
         if not config.has_helius:
-            return 0.0, ""
+            return 0.0, "", ""
 
         session = await self._get_session()
 
@@ -465,14 +466,14 @@ class SafetyChecker:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
-                    return 0.0, f"Deployer: {deployer[:8]}..."
+                    return 0.0, f"Deployer: {deployer[:8]}...", deployer
                 recent_txns = await resp.json(content_type=None)
         except Exception as e:
             logger.debug(f"[Safety] Deployer history error: {e}")
-            return 0.0, f"Deployer: {deployer[:8]}..."
+            return 0.0, f"Deployer: {deployer[:8]}...", deployer
 
         if not isinstance(recent_txns, list):
-            return 0.0, f"Deployer: {deployer[:8]}..."
+            return 0.0, f"Deployer: {deployer[:8]}...", deployer
 
         # Count how many tokens this wallet has deployed
         tokens_deployed = len(recent_txns)
@@ -516,7 +517,7 @@ class SafetyChecker:
             desc += ": " + " | ".join(flags)
             logger.info(f"[Safety] Deployer check: {desc} (risk={risk:.2f})")
 
-        return risk, desc
+        return risk, desc, deployer   # third element = full address
 
     # ── Fake volume detection ────────────────────────────────────────────────────
 
@@ -732,8 +733,14 @@ class SafetyChecker:
         pool_result       = results[5] if not isinstance(results[5], Exception) else ("unknown", 0.0, [])
         bundle_result     = results[6] if not isinstance(results[6], Exception) else (0.0, "")
         bundle_risk, bundle_desc = bundle_result if isinstance(bundle_result, tuple) else (0.0, "")
-        deployer_result   = results[7] if not isinstance(results[7], Exception) else (0.0, "")
-        deployer_risk, deployer_desc = deployer_result if isinstance(deployer_result, tuple) else (0.0, "")
+        deployer_result   = results[7] if not isinstance(results[7], Exception) else (0.0, "", "")
+        if isinstance(deployer_result, tuple) and len(deployer_result) == 3:
+            deployer_risk, deployer_desc, deployer_address = deployer_result
+        elif isinstance(deployer_result, tuple):
+            deployer_risk, deployer_desc = deployer_result
+            deployer_address = ""
+        else:
+            deployer_risk, deployer_desc, deployer_address = 0.0, "", ""
 
         mint_renounced, freeze_renounced = mint_auth_result
         token_program, dangerous_extensions = extension_result
@@ -833,11 +840,12 @@ class SafetyChecker:
             token_program=token_program,
             pool_creator=pool_creator,
             pool_fee_rate=pool_fee_rate,
-            lp_lock_verified=lp_burned is not None,
+            lp_lock_verified=lp_burned,
             bundle_risk=bundle_risk,
             bundle_detail=bundle_desc,
             fake_volume_risk=fake_vol_risk,
             fake_volume_detail=fake_vol_desc,
             deployer_risk=deployer_risk,
             deployer_detail=deployer_desc,
+            deployer_address=deployer_address,
         )

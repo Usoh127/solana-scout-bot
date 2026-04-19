@@ -161,6 +161,8 @@ class WebSocketMonitor:
     def __init__(self, position_monitor: "PositionMonitor"):
         self._pm              = position_monitor
         self._ws              = None
+        self._recv_task: Optional[asyncio.Task] = None
+        self._ping_task: Optional[asyncio.Task] = None
         self._running         = False
         self._subscriptions: dict[int, str] = {}   # sub_id -> mint
         self._pending_subs: dict[str, str]  = {}   # request_id -> mint
@@ -201,29 +203,46 @@ class WebSocketMonitor:
                     await asyncio.sleep(self.RECONNECT_DELAY)
 
     async def _connect_and_run(self, url: str):
-        async with websockets.connect(
-            url,
-            ping_interval=None,   # we handle pings manually
-            open_timeout=10,
-            close_timeout=5,
-        ) as ws:
-            self._ws        = ws
-            self._connected = True
-            self._subscriptions.clear()
-            self._pending_subs.clear()
-            logger.info("[WSMonitor] Connected to Helius WebSocket")
+        try:
+            async with websockets.connect(
+                url,
+                ping_interval=None,   # we handle pings manually
+                open_timeout=10,
+                close_timeout=5,
+            ) as ws:
+                self._ws        = ws
+                self._connected = True
+                self._subscriptions.clear()
+                self._pending_subs.clear()
+                logger.info("[WSMonitor] Connected to Helius WebSocket")
 
-            # Subscribe to all current positions
-            for mint in list(self._pm.positions.keys()):
-                pos = self._pm.positions.get(mint)
-                if pos and pos.pool_address:
-                    await self._subscribe(pos.pool_address, mint)
+                # Subscribe to all current positions
+                for mint in list(self._pm.positions.keys()):
+                    pos = self._pm.positions.get(mint)
+                    if pos and pos.pool_address:
+                        await self._subscribe(pos.pool_address, mint)
 
-            # Run receive loop + ping loop concurrently
-            await asyncio.gather(
-                self._receive_loop(ws),
-                self._ping_loop(ws),
-            )
+                # Reconnect as soon as either loop ends; don't wait for the
+                # 60s ping sleep to finish after a dead socket.
+                self._recv_task = asyncio.create_task(self._receive_loop(ws))
+                self._ping_task = asyncio.create_task(self._ping_loop(ws))
+                done, pending = await asyncio.wait(
+                    {self._recv_task, self._ping_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    exc = task.exception()
+                    if exc:
+                        raise exc
+        finally:
+            self._connected = False
+            self._ws = None
+            self._recv_task = None
+            self._ping_task = None
 
     async def _subscribe(self, pool_address: str, mint: str):
         """Subscribe to logs for a pool address."""
@@ -319,18 +338,7 @@ class WebSocketMonitor:
     async def _check_now(self, mint: str):
         """Immediately run position check — called on any pool activity."""
         try:
-            alert = await self._pm.check_position(mint)
-            if alert:
-                await self._pm._fire_alert(alert)
-                pos = self._pm.positions.get(mint)
-                if pos and pos.tokens_remaining <= 0:
-                    self._pm.remove_position(mint)
-                    # Unsubscribe from the pool
-                    for sub_id, m in list(self._subscriptions.items()):
-                        if m == mint:
-                            await self._unsubscribe(sub_id)
-                            del self._subscriptions[sub_id]
-                            break
+            await self._pm.check_position(mint)
         except Exception as e:
             logger.debug(f"[WSMonitor] Immediate check error: {e}")
 
@@ -367,6 +375,8 @@ class PositionMonitor:
         self._sentiment  = sentiment_analyzer
         self._session:   Optional[aiohttp.ClientSession] = None
         self._alert_callbacks: list = []
+        self._position_locks: dict[str, asyncio.Lock] = {}
+        self.ws_monitor: Optional[WebSocketMonitor] = None
         self._load_positions()
 
     # ── Session ───────────────────────────────────────────────────────────────
@@ -394,6 +404,7 @@ class PositionMonitor:
         if position.last_liquidity == 0.0:
             position.last_liquidity = position.liquidity_at_buy
         self.positions[position.mint] = position
+        self._position_locks.setdefault(position.mint, asyncio.Lock())
         self._save_positions()
         logger.info(
             f"[Monitor] Tracking {position.symbol} — "
@@ -410,6 +421,7 @@ class PositionMonitor:
     def remove_position(self, mint: str):
         if mint in self.positions:
             p = self.positions.pop(mint)
+            self._position_locks.pop(mint, None)
             self._save_positions()
             logger.info(f"[Monitor] Removed position: {p.symbol}")
             # Unsubscribe from pool websocket
@@ -433,6 +445,8 @@ class PositionMonitor:
         Call this once during bot startup.
         Runs in background — polling continues as fallback.
         """
+        if self.ws_monitor:
+            return
         self.ws_monitor = WebSocketMonitor(self)
         asyncio.create_task(self.ws_monitor.start())
         logger.info(
@@ -844,142 +858,151 @@ class PositionMonitor:
         pos = self.positions.get(mint)
         if not pos:
             return None
+        lock = self._position_locks.setdefault(mint, asyncio.Lock())
 
-        data = await self._fetch_current_data(mint)
-        if not data:
-            logger.debug(f"[Monitor] No data for {pos.symbol}, skipping")
-            return None
+        async with lock:
+            pos = self.positions.get(mint)
+            if not pos:
+                return None
 
-        current_price = data["price_usd"]
-        current_liq   = data["liquidity_usd"]
-        volume_1h     = data["volume_1h"]
-        volume_5m     = data["volume_5m"]
+            data = await self._fetch_current_data(mint)
+            if not data:
+                logger.debug(f"[Monitor] No data for {pos.symbol}, skipping")
+                return None
 
-        buy_price   = pos.buy_price_usd if pos.buy_price_usd > 0 else 1e-9
-        pct_change  = ((current_price - buy_price) / buy_price) * 100
-        liq_at_buy  = pos.liquidity_at_buy if pos.liquidity_at_buy > 0 else 1
-        liq_drop    = ((liq_at_buy - current_liq) / liq_at_buy) * 100
+            current_price = data["price_usd"]
+            current_liq   = data["liquidity_usd"]
+            volume_1h     = data["volume_1h"]
+            volume_5m     = data["volume_5m"]
 
-        # ── Run all automatic exits first ─────────────────────────────────────
-        auto_alert = await self._check_auto_exits(
-            pos, current_price, current_liq, volume_1h, volume_5m
-        )
-        if auto_alert:
-            await self._fire_alert(auto_alert)
-            # If position fully closed, remove it
-            if pos.tokens_remaining <= 0:
-                self.remove_position(mint)
-            return auto_alert
+            buy_price   = pos.buy_price_usd if pos.buy_price_usd > 0 else 1e-9
+            pct_change  = ((current_price - buy_price) / buy_price) * 100
+            liq_at_buy  = pos.liquidity_at_buy if pos.liquidity_at_buy > 0 else 1
+            liq_drop    = ((liq_at_buy - current_liq) / liq_at_buy) * 100
 
-        # ── Auto stop loss — executes immediately, no tap needed ────────────────
-        alert: Optional[MonitorAlert] = None
-
-        # Dynamic stop loss: tighter for newer tokens
-        stop_pct = config.STOP_LOSS_PCT
-        if pos.token_age_at_buy < (5 / 60):   # under 5min old at buy
-            stop_pct = min(stop_pct, 10.0)
-        elif pos.token_age_at_buy < 0.5:       # under 30min old at buy
-            stop_pct = min(stop_pct, 12.0)
-
-        if not pos.stop_loss_alerted and pct_change <= -stop_pct:
-            logger.warning(
-                f"[Monitor] STOP LOSS AUTO-EXIT: {pos.symbol} "
-                f"down {pct_change:.1f}% — selling immediately"
+            # ── Run all automatic exits first ─────────────────────────────────
+            auto_alert = await self._check_auto_exits(
+                pos, current_price, current_liq, volume_1h, volume_5m
             )
-            ok, detail = await self._auto_sell(
-                pos, pos.tokens_remaining, f"stop loss -{stop_pct}%"
-            )
-            pnl_str = f"{pct_change:+.1f}%"
-            msg = (
-                f"🛑 <b>STOP LOSS — AUTO EXIT</b>\n\n"
-                f"Token: <b>${pos.symbol}</b>\n"
-                f"Down {abs(pct_change):.1f}% from buy price\n"
-                f"Buy:  ${buy_price:.8f}\n"
-                f"Exit: ${current_price:.8f}\n"
-                f"PnL:  {pnl_str}\n\n"
-                f"{'Auto-sold all remaining tokens' if ok else 'SELL FAILED — act manually now!'}\n"
-                f"{detail}"
-            )
-            pos.stop_loss_alerted = True
-            alert = MonitorAlert(
-                mint=mint, symbol=pos.symbol,
-                alert_type=ALERT_STOP_LOSS,
-                current_price=current_price, buy_price=buy_price,
-                pct_change=pct_change, current_liquidity=current_liq,
-                liquidity_drop_pct=liq_drop, message=msg,
-            )
-            if ok:
-                self.remove_position(mint)
+            if auto_alert:
+                await self._fire_alert(auto_alert)
+                # If position fully closed, remove it
+                if pos.tokens_remaining <= 0:
+                    self.remove_position(mint)
+                return auto_alert
 
-        # ── Auto liquidity exit — rug in progress, no tap needed ──────────────
-        elif not pos.liquidity_alerted and liq_drop >= config.LIQUIDITY_DROP_ALERT_PCT:
-            logger.warning(
-                f"[Monitor] LIQUIDITY RUG AUTO-EXIT: {pos.symbol} "
-                f"liq down {liq_drop:.1f}% — selling immediately"
-            )
-            ok, detail = await self._auto_sell(
-                pos, pos.tokens_remaining, f"liquidity rug -{liq_drop:.0f}%"
-            )
-            msg = (
-                f"🚨 <b>LIQUIDITY RUG — AUTO EXIT</b>\n\n"
-                f"Token: <b>${pos.symbol}</b>\n"
-                f"Liquidity dropped {liq_drop:.1f}%\n"
-                f"Was: ${liq_at_buy:,.0f} → Now: ${current_liq:,.0f}\n"
-                f"PnL: {pct_change:+.1f}%\n\n"
-                f"{'Auto-sold all remaining tokens' if ok else 'SELL FAILED — act manually now!'}\n"
-                f"{detail}"
-            )
-            pos.liquidity_alerted = True
-            alert = MonitorAlert(
-                mint=mint, symbol=pos.symbol,
-                alert_type=ALERT_LIQUIDITY_DROP,
-                current_price=current_price, buy_price=buy_price,
-                pct_change=pct_change, current_liquidity=current_liq,
-                liquidity_drop_pct=liq_drop, message=msg,
-            )
-            if ok:
-                self.remove_position(mint)
+            # ── Auto stop loss — executes immediately, no tap needed ──────────
+            alert: Optional[MonitorAlert] = None
 
-        elif not pos.dump_alerted:
-            if time.time() - pos.last_alert_time >= 300:
-                dump_msg = await self._check_large_dump(mint)
-                if dump_msg:
-                    alert = MonitorAlert(
-                        mint=mint, symbol=pos.symbol,
-                        alert_type=ALERT_LARGE_DUMP,
-                        current_price=current_price, buy_price=buy_price,
-                        pct_change=pct_change, current_liquidity=current_liq,
-                        liquidity_drop_pct=liq_drop, message=dump_msg,
-                    )
-                    pos.dump_alerted      = True
-                    pos.last_alert_time   = time.time()
+            # Dynamic stop loss: tighter for newer tokens
+            stop_pct = config.STOP_LOSS_PCT
+            if pos.token_age_at_buy < (5 / 60):   # under 5min old at buy
+                stop_pct = min(stop_pct, 10.0)
+            elif pos.token_age_at_buy < 0.5:       # under 30min old at buy
+                stop_pct = min(stop_pct, 12.0)
 
-        elif not pos.sentiment_alerted:
-            if time.time() - pos.last_alert_time >= 600:
-                sent_msg = await self._check_sentiment_spike(
-                    pos.name, pos.symbol, mint
+            if not pos.stop_loss_alerted and pct_change <= -stop_pct:
+                logger.warning(
+                    f"[Monitor] STOP LOSS AUTO-EXIT: {pos.symbol} "
+                    f"down {pct_change:.1f}% — selling immediately"
                 )
-                if sent_msg:
-                    alert = MonitorAlert(
-                        mint=mint, symbol=pos.symbol,
-                        alert_type=ALERT_SENTIMENT_BEARISH,
-                        current_price=current_price, buy_price=buy_price,
-                        pct_change=pct_change, current_liquidity=current_liq,
-                        liquidity_drop_pct=liq_drop, message=sent_msg,
+                ok, detail = await self._auto_sell(
+                    pos, pos.tokens_remaining, f"stop loss -{stop_pct}%"
+                )
+                pnl_str = f"{pct_change:+.1f}%"
+                msg = (
+                    f"🛑 <b>STOP LOSS — AUTO EXIT</b>\n\n"
+                    f"Token: <b>${pos.symbol}</b>\n"
+                    f"Down {abs(pct_change):.1f}% from buy price\n"
+                    f"Buy:  ${buy_price:.8f}\n"
+                    f"Exit: ${current_price:.8f}\n"
+                    f"PnL:  {pnl_str}\n\n"
+                    f"{'Auto-sold all remaining tokens' if ok else 'SELL FAILED — act manually now!'}\n"
+                    f"{detail}"
+                )
+                pos.stop_loss_alerted = True
+                alert = MonitorAlert(
+                    mint=mint, symbol=pos.symbol,
+                    alert_type=ALERT_STOP_LOSS,
+                    current_price=current_price, buy_price=buy_price,
+                    pct_change=pct_change, current_liquidity=current_liq,
+                    liquidity_drop_pct=liq_drop, message=msg,
+                )
+                if ok:
+                    self.remove_position(mint)
+
+            # ── Auto liquidity exit — rug in progress, no tap needed ────────
+            elif (
+                not pos.liquidity_alerted
+                and liq_drop >= config.LIQUIDITY_DROP_ALERT_PCT
+            ):
+                logger.warning(
+                    f"[Monitor] LIQUIDITY RUG AUTO-EXIT: {pos.symbol} "
+                    f"liq down {liq_drop:.1f}% — selling immediately"
+                )
+                ok, detail = await self._auto_sell(
+                    pos, pos.tokens_remaining, f"liquidity rug -{liq_drop:.0f}%"
+                )
+                msg = (
+                    f"🚨 <b>LIQUIDITY RUG — AUTO EXIT</b>\n\n"
+                    f"Token: <b>${pos.symbol}</b>\n"
+                    f"Liquidity dropped {liq_drop:.1f}%\n"
+                    f"Was: ${liq_at_buy:,.0f} → Now: ${current_liq:,.0f}\n"
+                    f"PnL: {pct_change:+.1f}%\n\n"
+                    f"{'Auto-sold all remaining tokens' if ok else 'SELL FAILED — act manually now!'}\n"
+                    f"{detail}"
+                )
+                pos.liquidity_alerted = True
+                alert = MonitorAlert(
+                    mint=mint, symbol=pos.symbol,
+                    alert_type=ALERT_LIQUIDITY_DROP,
+                    current_price=current_price, buy_price=buy_price,
+                    pct_change=pct_change, current_liquidity=current_liq,
+                    liquidity_drop_pct=liq_drop, message=msg,
+                )
+                if ok:
+                    self.remove_position(mint)
+
+            elif not pos.dump_alerted:
+                if time.time() - pos.last_alert_time >= 300:
+                    dump_msg = await self._check_large_dump(mint)
+                    if dump_msg:
+                        alert = MonitorAlert(
+                            mint=mint, symbol=pos.symbol,
+                            alert_type=ALERT_LARGE_DUMP,
+                            current_price=current_price, buy_price=buy_price,
+                            pct_change=pct_change, current_liquidity=current_liq,
+                            liquidity_drop_pct=liq_drop, message=dump_msg,
+                        )
+                        pos.dump_alerted      = True
+                        pos.last_alert_time   = time.time()
+
+            elif not pos.sentiment_alerted:
+                if time.time() - pos.last_alert_time >= 600:
+                    sent_msg = await self._check_sentiment_spike(
+                        pos.name, pos.symbol, mint
                     )
-                    pos.sentiment_alerted = True
-                    pos.last_alert_time   = time.time()
+                    if sent_msg:
+                        alert = MonitorAlert(
+                            mint=mint, symbol=pos.symbol,
+                            alert_type=ALERT_SENTIMENT_BEARISH,
+                            current_price=current_price, buy_price=buy_price,
+                            pct_change=pct_change, current_liquidity=current_liq,
+                            liquidity_drop_pct=liq_drop, message=sent_msg,
+                        )
+                        pos.sentiment_alerted = True
+                        pos.last_alert_time   = time.time()
 
-        if alert:
-            await self._fire_alert(alert)
-            return alert
+            if alert:
+                await self._fire_alert(alert)
+                return alert
 
-        logger.debug(
-            f"[Monitor] {pos.symbol}: {pct_change:+.1f}% from buy | "
-            f"peak {pos.peak_price / buy_price:.2f}x | "
-            f"liq drop {liq_drop:.1f}%"
-        )
-        return None
+            logger.debug(
+                f"[Monitor] {pos.symbol}: {pct_change:+.1f}% from buy | "
+                f"peak {pos.peak_price / buy_price:.2f}x | "
+                f"liq drop {liq_drop:.1f}%"
+            )
+            return None
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 

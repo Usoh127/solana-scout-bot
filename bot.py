@@ -29,7 +29,6 @@ from telegram.ext import (
     ContextTypes,
 )
 
-import os
 from config import config
 from executor import TradeExecutor
 from monitor import MonitorAlert, Position, PositionMonitor
@@ -137,8 +136,8 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score += 1
         reasons.append("decent vol/liq")
 
-    holder_pct = 0.0
-    if opp.safety_detail:
+    holder_pct = opp.safety_top10_holder_pct or 0.0
+    if holder_pct <= 0 and opp.safety_detail:
         for line in opp.safety_detail.splitlines():
             if "Top-10 holders" in line or "top-10" in line.lower():
                 match = re.search(r"(\d+\.?\d*)%", line)
@@ -156,13 +155,72 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score -= 1
         penalties.append(f"⚠️ top-10 own {holder_pct:.0f}% — elevated dump risk")
 
-    if opp.safety_detail and "LP lock unverified" in opp.safety_detail:
+    lp_lock_unverified = (
+        opp.safety_lp_lock_verified is False
+        or (
+            opp.safety_lp_lock_verified is None
+            and opp.safety_detail
+            and "LP lock unverified" in opp.safety_detail
+        )
+    )
+    if lp_lock_unverified:
         score -= 1
         penalties.append("⚠️ LP lock unverified")
+
+    bundle_risk = opp.safety_bundle_risk
+    fake_volume_risk = opp.safety_fake_volume_risk
+    deployer_risk = opp.safety_deployer_risk
+    if (bundle_risk <= 0 or fake_volume_risk <= 0 or deployer_risk <= 0) and opp.safety_detail:
+        lowered_detail = opp.safety_detail.lower()
+        if bundle_risk <= 0 and "bundle" in lowered_detail:
+            bundle_risk = 0.3
+        if fake_volume_risk <= 0 and "volume quality concern" in lowered_detail:
+            fake_volume_risk = 0.3
+        if deployer_risk <= 0 and "deployer " in lowered_detail:
+            deployer_risk = 0.3
+
+    if bundle_risk >= 0.5:
+        score -= 3
+        penalties.append("🚨 high bundle risk")
+    elif bundle_risk >= 0.25:
+        score -= 1
+        penalties.append("⚠️ mild bundle signals")
+
+    if fake_volume_risk >= 0.5:
+        score -= 3
+        penalties.append("🚨 likely fake volume")
+    elif fake_volume_risk >= 0.25:
+        score -= 1
+        penalties.append("⚠️ volume quality concern")
+
+    if deployer_risk >= 0.5:
+        score -= 3
+        penalties.append("🚨 serial deployer risk")
+    elif deployer_risk >= 0.25:
+        score -= 1
+        penalties.append("⚠️ deployer pattern risk")
 
     score = max(1, min(10, score))
     rationale = " · ".join((reasons[:2] + penalties[:2]))
     return score, rationale
+
+
+def _format_deployer_line(opp) -> str:
+    """Extract deployer wallet from safety detail and format as clickable link."""
+    import re
+    addr = getattr(opp, "safety_deployer_address", "") or ""
+    if not addr and opp.safety_detail:
+        match = re.search(r"Deployer ([A-Za-z0-9]{32,44})", opp.safety_detail)
+        if match:
+            addr = match.group(1)
+    if not addr:
+        return ""
+    short = f"{addr[:6]}...{addr[-4:]}"
+    return (
+        f"👨\u200d💻 Dev: "
+        f"<a href=\"https://solscan.io/account/{addr}\">"
+        f"<code>{short}</code></a>\n"
+    )
 
 
 def _get_buy_amount(confidence: int) -> float:
@@ -402,7 +460,8 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"{'━' * 28}\n"
         f"🪙 <b>{html.escape(opp.name)}</b>  <code>${html.escape(opp.symbol)}</code>\n"
         f"📍 <code>{opp.mint}</code>\n"
-        f"🏊 DEX: {html.escape(opp.dex.title())}"
+        + _format_deployer_line(opp)
+        + f"🏊 DEX: {html.escape(opp.dex.title())}"
         + ("  📊 <b>DEX Enhanced Paid</b>" if hasattr(opp, "dex_paid") and opp.dex_paid else "")
         + "\n\n"
         f"💰 <b>Financials</b>\n"
@@ -562,6 +621,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  /scan — manual scan now\n"
         f"  /positions — open positions\n"
         f"  /balance — SOL balance\n"
+        f"  /walletbalances — tracked wallet balances\n"
         f"  /help — all commands\n\n"
         f"<i>Auto-scan is running in the background. "
         f"Briefings will be sent here automatically.</i>",
@@ -578,6 +638,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/scan      — trigger manual scan\n"
         "/positions — list open positions\n"
         "/balance   — check wallet SOL balance\n"
+        "/walletbalances — tracked wallet SOL balances\n"
         "/stop      — stop background scanning\n"
         "/help      — this message\n\n"
         "<b>Thresholds (set in .env)</b>\n"
@@ -692,6 +753,27 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"- <b>{html.escape(w.name)}</b>\n  <code>{w.address}</code>  (buys: {w.buy_count})")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
+
+async def cmd_walletbalances(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        return await _unauthorized(update, context)
+
+    wallets = wallet_tracker.list_wallets()
+    if not wallets:
+        await update.message.reply_text("No wallets tracked yet. Use /addwallet [address] [name]")
+        return
+
+    balances = await wallet_tracker.get_all_wallet_balances()
+    lines = ["<b>Copytrading Wallet Balances</b>\n"]
+    for wallet, balance in balances:
+        balance_text = f"{balance:.4f} SOL" if balance is not None else "unavailable"
+        lines.append(
+            f"- <b>{html.escape(wallet.name)}</b>\n"
+            f"  <code>{wallet.address}</code>\n"
+            f"  Balance: {balance_text}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         return await _unauthorized(update, context)
@@ -754,6 +836,14 @@ async def _run_scan_cycle(
                 )
                 opp.safety_passed = safety_result.passed
                 opp.safety_detail = safety_result.detail
+                opp.safety_top10_holder_pct = safety_result.top10_holder_pct
+                opp.safety_lp_lock_verified = safety_result.lp_lock_verified
+                opp.safety_bundle_risk = safety_result.bundle_risk
+                opp.safety_fake_volume_risk = safety_result.fake_volume_risk
+                opp.safety_deployer_risk = safety_result.deployer_risk
+                opp.safety_deployer_address = getattr(
+                    safety_result, "deployer_address", ""
+                )
 
                 if not safety_result.passed:
                     logger.info(
@@ -1096,10 +1186,6 @@ def main():
     monitor.register_alert_callback(
         lambda alert: _on_risk_alert(alert, app)
     )
-
-    # Start real-time websocket monitor for sub-second stop loss detection
-    import asyncio as _aio_ws
-    _aio_ws.get_event_loop().run_until_complete(monitor.start_ws_monitor())
     wallet_tracker.register_alert_callback(lambda alert: _on_wallet_alert(alert, app))
     port = int(os.environ.get("PORT", 8080))
     public_url = os.environ.get("RAILWAY_PUBLIC_URL", "")
@@ -1118,6 +1204,7 @@ def main():
     app.add_handler(CommandHandler("addwallet", cmd_addwallet))
     app.add_handler(CommandHandler("removewallet", cmd_removewallet))
     app.add_handler(CommandHandler("wallets", cmd_wallets))
+    app.add_handler(CommandHandler("walletbalances", cmd_walletbalances))
 
     # Inline keyboard callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
