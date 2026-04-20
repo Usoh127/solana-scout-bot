@@ -760,19 +760,59 @@ async def cmd_walletbalances(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     wallets = wallet_tracker.list_wallets()
     if not wallets:
-        await update.message.reply_text("No wallets tracked yet. Use /addwallet [address] [name]")
+        await update.message.reply_text(
+            "No wallets tracked yet. Use /addwallet [address] [name]"
+        )
         return
 
+    # Fetch current SOL price in USD
+    sol_price_usd = 0.0
+    try:
+        session = await wallet_tracker._get_session()
+        async with session.get(
+            "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status == 200:
+                data  = await resp.json(content_type=None)
+                pairs = data.get("pairs") or []
+                if pairs:
+                    pairs.sort(
+                        key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+                        reverse=True,
+                    )
+                    sol_price_usd = float(pairs[0].get("priceUsd") or 0)
+    except Exception as e:
+        logger.warning(f"[Bot] SOL price fetch error: {e}")
+
     balances = await wallet_tracker.get_all_wallet_balances()
-    lines = ["<b>Copytrading Wallet Balances</b>\n"]
+    lines    = [
+        f"<b>Copytrading Wallet Balances</b>"
+        + (f"\n<i>SOL price: ${sol_price_usd:,.2f}</i>" if sol_price_usd else "")
+        + "\n"
+    ]
+
     for wallet, balance in balances:
-        balance_text = f"{balance:.4f} SOL" if balance is not None else "unavailable"
+        if balance is not None:
+            usd_val      = balance * sol_price_usd
+            balance_text = (
+                f"{balance:.4f} SOL"
+                + (f" (${usd_val:,.2f})" if sol_price_usd else "")
+            )
+        else:
+            balance_text = "unavailable"
+
         lines.append(
-            f"- <b>{html.escape(wallet.name)}</b>\n"
+            f"• <b>{html.escape(wallet.name)}</b>\n"
             f"  <code>{wallet.address}</code>\n"
-            f"  Balance: {balance_text}"
+            f"  Balance: <b>{balance_text}</b>\n"
+            f"  Buys tracked: {wallet.buy_count}"
         )
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML
+    )
 
 
 async def cmd_walletbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
