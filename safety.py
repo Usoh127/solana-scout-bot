@@ -482,13 +482,13 @@ class SafetyChecker:
 
         vol_liq = volume_24h / liquidity
         if vol_liq > 100:
-            risk += 0.6
-            flags.append(f"vol/liq ratio {vol_liq:.0f}x — extreme (likely wash trading)")
+            risk += 0.7
+            flags.append(f"vol/liq ratio {vol_liq:.0f}x — extreme wash trading")
         elif vol_liq > 50:
-            risk += 0.3
+            risk += 0.4
             flags.append(f"vol/liq ratio {vol_liq:.0f}x — suspicious")
-        elif vol_liq > 30:
-            risk += 0.1
+        elif vol_liq > 20:
+            risk += 0.2
             flags.append(f"vol/liq ratio {vol_liq:.0f}x — elevated")
 
         if txns_24h > 0:
@@ -666,9 +666,13 @@ class SafetyChecker:
         fake_vol_risk, fake_vol_desc = self._check_fake_volume(
             opp_volume_24h, opp_liquidity, opp_txns_24h
         )
-        if fake_vol_risk >= 0.5 and fake_vol_desc:
+        if fake_vol_risk >= 0.7 and fake_vol_desc:
+            # Extreme fake volume = instant kill, count as 2 red flags
+            pool_warnings.append(f"🚨 FAKE VOLUME CONFIRMED: {fake_vol_desc}")
+            pool_warnings.append(f"🚨 FAKE VOLUME (2nd flag): auto-fail")
+        elif fake_vol_risk >= 0.5 and fake_vol_desc:
             pool_warnings.append(f"🚨 FAKE VOLUME LIKELY: {fake_vol_desc}")
-        elif fake_vol_risk >= 0.25 and fake_vol_desc:
+        elif fake_vol_risk >= 0.2 and fake_vol_desc:
             pool_warnings.append(f"⚠️ Volume quality concern: {fake_vol_desc}")
 
         is_honeypot, red_flags = self._check_honeypot_heuristics(

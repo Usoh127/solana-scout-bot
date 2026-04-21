@@ -6,12 +6,17 @@ Secondary:       GeckoTerminal (free, no key needed)   → new Solana pools
 Tertiary:        DexScreener (free, no key needed)     → detailed pair data + trending
 Quaternary:      Birdeye (API key needed for full data)
 
-pump.fun is prioritised because it surfaces tokens at or near launch — before
-GeckoTerminal and DexScreener index them. This is the fix for late-signal alerts.
+Improvements in this version:
+  1. Vol/MC ratio pre-filter — volume must be > 30% of market cap for non-pumpfun tokens.
+     Guide reference: volume below 80% of MC = likely bundled. We use 30% as a softer floor
+     to avoid being too aggressive while still killing obvious wash-trading setups.
 
-Tokens are filtered against ALL configured thresholds before being returned.
-pump.fun tokens are exempt from volume and price-change threshold checks since
-those data points aren't available until the token graduates or gets indexed.
+  2. Bonding curve progress — pump.fun tokens now extract and expose graduation progress.
+     Tokens at 70-95% bonding are pre-graduation plays (the best entry window).
+     Tokens under 15% bonding are filtered out (too early, too risky).
+     Tokens over 97% are also skipped (about to graduate, price already moved).
+
+  3. Bonding curve progress shown in briefing via pumpfun_bonding_pct field.
 """
 
 from __future__ import annotations
@@ -106,7 +111,7 @@ class TokenOpportunity:
     news_summary: str = ""
     reddit_summary: str = ""
 
-    # overall confidence 1-10 set by briefing builder
+    # overall confidence 1-10
     confidence: int = 0
     confidence_rationale: str = ""
 
@@ -124,9 +129,10 @@ class TokenOpportunity:
     # Transaction count
     txns_24h: int = 0
 
-    # pump.fun specific extras (surfaced in briefing)
+    # pump.fun specific
     pumpfun_reply_count: int = 0
     pumpfun_is_koth: bool = False
+    pumpfun_bonding_progress: float = 0.0   # 0-100, how far to graduation
 
     first_seen: float = field(default_factory=time.time)
 
@@ -149,6 +155,20 @@ class TokenOpportunity:
             sign = "+" if self.price_change_24h > 0 else ""
             lines.append(f"{sign}{self.price_change_24h:.1f}% (24h)")
         return "  |  ".join(lines) if lines else "no data"
+
+    @property
+    def bonding_label(self) -> str:
+        """Human readable bonding curve status for briefing."""
+        if self.pumpfun_bonding_progress <= 0:
+            return ""
+        p = self.pumpfun_bonding_progress
+        if p >= 95:
+            return f"🚀 {p:.0f}% — graduating soon!"
+        if p >= 70:
+            return f"🔥 {p:.0f}% — pre-graduation zone"
+        if p >= 40:
+            return f"📈 {p:.0f}% bonding"
+        return f"⏳ {p:.0f}% bonding"
 
 
 # ─── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -221,9 +241,12 @@ class TokenScout:
     async def _fetch_pumpfun_new(self) -> list[dict]:
         """
         Fetch brand new and recently active tokens from pump.fun.
-        Two queries: newest first + most recently traded.
-        This catches tokens at or near launch — before DexScreener indexes them.
-        Free, no API key required.
+
+        Key improvements:
+        - Extracts bonding_curve_progress (0-100%)
+        - Filters tokens < 15% bonding (too early, high rug risk)
+        - Filters tokens > 97% bonding (about to graduate, price already moved)
+        - Prioritises 70-95% range (pre-graduation zone = best entry window)
         """
         session  = await self._get_session()
         results  = []
@@ -234,10 +257,10 @@ class TokenScout:
                 async with session.get(
                     f"{PUMPFUN_BASE}/coins",
                     params={
-                        "sort":         sort_by,
-                        "order":        "DESC",
-                        "limit":        50,
-                        "includeNsfw":  "false",
+                        "sort":        sort_by,
+                        "order":       "DESC",
+                        "limit":       50,
+                        "includeNsfw": "false",
                     },
                     headers={"Accept": "application/json"},
                     timeout=aiohttp.ClientTimeout(total=15),
@@ -255,13 +278,36 @@ class TokenScout:
                             continue
                         seen_set.add(mint)
 
-                        # Skip graduated tokens — DexScreener / GeckoTerminal will catch those
+                        # Skip graduated tokens
                         if coin.get("complete") or coin.get("raydium_pool"):
+                            continue
+
+                        # ── Extract bonding curve progress ────────────────────
+                        # pump.fun returns this as a float 0-100
+                        bonding_progress = float(
+                            coin.get("bonding_curve_progress") or
+                            coin.get("progress") or 0
+                        )
+
+                        # Filter: too early (< 15%) = high rug risk, skip
+                        if bonding_progress < 15:
+                            logger.debug(
+                                f"[Scout] Skipping {coin.get('symbol')} — "
+                                f"bonding only {bonding_progress:.0f}% (too early)"
+                            )
+                            continue
+
+                        # Filter: about to graduate (> 97%) = price already moved, skip
+                        if bonding_progress > 97:
+                            logger.debug(
+                                f"[Scout] Skipping {coin.get('symbol')} — "
+                                f"bonding {bonding_progress:.0f}% (graduating, too late)"
+                            )
                             continue
 
                         # Parse age
                         created_ts = coin.get("created_timestamp", 0)
-                        if created_ts > 1e12:        # milliseconds → seconds
+                        if created_ts > 1e12:
                             created_ts /= 1000
 
                         created_at = None
@@ -275,58 +321,62 @@ class TokenScout:
                             except Exception:
                                 pass
 
-                        # Pre-filter by age to avoid wasted threshold checks later
                         if age_hours > config.MAX_TOKEN_AGE_HOURS:
                             continue
 
                         usd_mcap = float(coin.get("usd_market_cap") or 0)
 
-                        # Basic market cap gates
                         if usd_mcap < config.MIN_MARKET_CAP_USD:
                             continue
                         if usd_mcap > config.MAX_MARKET_CAP_USD:
                             continue
 
-                        # Estimate liquidity from bonding curve virtual reserves
-                        # virtual_sol_reserves is in lamports
-                        virtual_sol = coin.get("virtual_sol_reserves", 0) / 1e9
-                        # ~$150 per SOL as rough floor estimate (actual enriched by DexScreener later)
+                        virtual_sol   = coin.get("virtual_sol_reserves", 0) / 1e9
                         est_liquidity = max(virtual_sol * 150, usd_mcap * 0.25)
 
                         is_koth      = bool(coin.get("king_of_the_hill_timestamp"))
                         reply_count  = int(coin.get("reply_count") or 0)
 
                         results.append({
-                            "mint":                 mint,
-                            "name":                 coin.get("name", "Unknown"),
-                            "symbol":               coin.get("symbol", "???"),
-                            "pool_address":         coin.get("bonding_curve", ""),
-                            "dex":                  "pump.fun",
-                            "price_usd":            0.0,
-                            "market_cap_usd":       usd_mcap,
-                            "fdv_usd":              usd_mcap,
-                            "liquidity_usd":        est_liquidity,
-                            # Volume unknown until DexScreener indexes — set 0,
-                            # _meets_thresholds skips volume check for pumpfun source
-                            "volume_24h_usd":       0.0,
-                            "volume_6h_usd":        0.0,
-                            "volume_1h_usd":        0.0,
-                            # Price history unknown from pump.fun API — set 0,
-                            # _meets_thresholds skips price change check for pumpfun source
-                            "price_change_1h":      0.0,
-                            "price_change_6h":      0.0,
-                            "price_change_24h":     0.0,
-                            "launched_at":          created_at,
-                            "age_hours":            age_hours,
-                            "source":               "pumpfun",
-                            "pumpfun_reply_count":  reply_count,
-                            "pumpfun_is_koth":      is_koth,
+                            "mint":                    mint,
+                            "name":                    coin.get("name", "Unknown"),
+                            "symbol":                  coin.get("symbol", "???"),
+                            "pool_address":            coin.get("bonding_curve", ""),
+                            "dex":                     "pump.fun",
+                            "price_usd":               0.0,
+                            "market_cap_usd":          usd_mcap,
+                            "fdv_usd":                 usd_mcap,
+                            "liquidity_usd":           est_liquidity,
+                            "volume_24h_usd":          0.0,
+                            "volume_6h_usd":           0.0,
+                            "volume_1h_usd":           0.0,
+                            "price_change_1h":         0.0,
+                            "price_change_6h":         0.0,
+                            "price_change_24h":        0.0,
+                            "launched_at":             created_at,
+                            "age_hours":               age_hours,
+                            "source":                  "pumpfun",
+                            "pumpfun_reply_count":     reply_count,
+                            "pumpfun_is_koth":         is_koth,
+                            "pumpfun_bonding_progress": bonding_progress,
                         })
 
             except Exception as e:
                 logger.warning(f"[Scout] PumpFun {sort_by} fetch error: {e}")
 
             await asyncio.sleep(0.3)
+
+        # ── Sort: prioritise pre-graduation zone (70-95%) ──────────────────
+        # Tokens close to graduation get surfaced first
+        def bonding_priority(t: dict) -> float:
+            p = t.get("pumpfun_bonding_progress", 0)
+            if 70 <= p <= 95:
+                return -p        # highest bonding in this range first
+            if p > 95:
+                return 0         # already too close — deprioritise
+            return -(p * 0.5)    # still show but lower priority
+
+        results.sort(key=bonding_priority)
 
         logger.info(f"[Scout] PumpFun returned {len(results)} raw tokens")
         return results
@@ -568,8 +618,15 @@ class TokenScout:
     def _meets_thresholds(self, t: dict) -> tuple[bool, str]:
         """
         Hard gate. Returns (passes, reason_if_failed).
-        pump.fun tokens are exempt from volume and price-change checks
-        because that data isn't available until the token is indexed by DEX aggregators.
+
+        New in this version:
+          Vol/MC ratio check — volume must be at least 30% of market cap for
+          non-pumpfun tokens. Guide says 80% is ideal; we use 30% as a softer
+          floor so we don't over-filter. Anything below 30% is almost certainly
+          bundled or wash-traded.
+
+          pump.fun tokens skip this check since they don't have real volume
+          data until they graduate and get indexed by DEX aggregators.
         """
         liq    = t.get("liquidity_usd", 0)
         vol    = t.get("volume_24h_usd", 0)
@@ -579,14 +636,27 @@ class TokenScout:
         source = t.get("source", "")
         is_pumpfun = source == "pumpfun"
 
-        # Liquidity: relax the floor for pump.fun tokens (estimated value)
+        # Liquidity: relax floor for pump.fun (estimated value)
         liq_min = config.MIN_LIQUIDITY_USD * 0.3 if is_pumpfun else config.MIN_LIQUIDITY_USD
         if liq < liq_min:
             return False, f"liquidity ${liq:,.0f} < min ${liq_min:,.0f}"
 
-        # Volume: skip for pump.fun (bonding curve doesn't report standard volume)
+        # Volume: skip for pump.fun (no real volume data on bonding curve)
         if not is_pumpfun and vol < config.MIN_VOLUME_24H_USD:
             return False, f"volume ${vol:,.0f} < min ${config.MIN_VOLUME_24H_USD:,.0f}"
+
+        # ── NEW: Vol/MC ratio check ───────────────────────────────────────────
+        # Volume should be at least 30% of market cap.
+        # Below this = almost certainly bundled, wash-traded, or completely dead.
+        # Guide reference: below 80% = suspect. We use 30% as a practical floor.
+        # Skip for pump.fun (no real volume data available).
+        if not is_pumpfun and mc > 0 and vol > 0:
+            vol_mc_ratio = vol / mc
+            if vol_mc_ratio < 0.30:
+                return False, (
+                    f"vol/MC ratio {vol_mc_ratio:.1%} < 30% — likely bundled or dead "
+                    f"(vol ${vol:,.0f} vs MC ${mc:,.0f})"
+                )
 
         if mc < config.MIN_MARKET_CAP_USD:
             return False, f"mcap ${mc:,.0f} < min ${config.MIN_MARKET_CAP_USD:,.0f}"
@@ -595,7 +665,7 @@ class TokenScout:
         if age > config.MAX_TOKEN_AGE_HOURS:
             return False, f"age {age:.1f}h > max {config.MAX_TOKEN_AGE_HOURS}h"
 
-        # Price change: skip for pump.fun (no historical price from bonding curve API)
+        # Price change: skip for pump.fun
         if not is_pumpfun and p1h < config.MIN_PRICE_CHANGE_1H:
             return False, f"1h price change {p1h:.1f}% < min {config.MIN_PRICE_CHANGE_1H}%"
 
@@ -642,7 +712,8 @@ class TokenScout:
     def _dedup(self, raw_list: list[dict]) -> list[dict]:
         """
         Merge duplicate mints. If the same mint appears from both pump.fun and
-        DexScreener, prefer the DexScreener entry (has real volume/price data).
+        DexScreener, prefer the DexScreener entry (has real volume/price data)
+        but carry over pump.fun bonding progress.
         """
         seen: dict[str, dict] = {}
         for t in raw_list:
@@ -653,11 +724,11 @@ class TokenScout:
                 seen[mint] = t
             else:
                 existing = seen[mint]
-                # Prefer entry with real volume data over pump.fun estimate
                 if t.get("source") != "pumpfun" and existing.get("source") == "pumpfun":
-                    # Merge: keep DexScreener data but carry pump.fun extras
-                    t["pumpfun_reply_count"] = existing.get("pumpfun_reply_count", 0)
-                    t["pumpfun_is_koth"]     = existing.get("pumpfun_is_koth", False)
+                    # Merge: keep DexScreener data, carry pump.fun extras
+                    t["pumpfun_reply_count"]     = existing.get("pumpfun_reply_count", 0)
+                    t["pumpfun_is_koth"]         = existing.get("pumpfun_is_koth", False)
+                    t["pumpfun_bonding_progress"] = existing.get("pumpfun_bonding_progress", 0.0)
                     seen[mint] = t
                 elif t.get("liquidity_usd", 0) > existing.get("liquidity_usd", 0):
                     seen[mint] = t
@@ -666,13 +737,8 @@ class TokenScout:
     # ── Main scan ──────────────────────────────────────────────────────────────
 
     async def scan_for_opportunities(self) -> list[TokenOpportunity]:
-        """
-        Full scan cycle. Returns list of TokenOpportunity objects that have
-        passed ALL configured thresholds and are not on cooldown.
-        """
         logger.info("[Scout] Starting scan cycle…")
 
-        # Gather from all sources in parallel — pump.fun is first/primary
         pump_task  = asyncio.create_task(self._fetch_pumpfun_new())
         gecko_task = asyncio.create_task(self._fetch_gecko_new_pools())
         dex_task   = asyncio.create_task(self._fetch_dexscreener_trending())
@@ -703,7 +769,6 @@ class TokenScout:
                 logger.debug(f"[Scout] {t.get('symbol')} dropped: {reason}")
                 continue
 
-            # Copycat detection
             ticker_upper = t["symbol"].upper()
             if ticker_upper in self._seen_tickers and self._seen_tickers[ticker_upper] != mint:
                 logger.info(
@@ -742,6 +807,7 @@ class TokenScout:
                 txns_24h=t.get("txns_24h", 0),
                 pumpfun_reply_count=t.get("pumpfun_reply_count", 0),
                 pumpfun_is_koth=t.get("pumpfun_is_koth", False),
+                pumpfun_bonding_progress=t.get("pumpfun_bonding_progress", 0.0),
             )
             opportunities.append(opp)
 
