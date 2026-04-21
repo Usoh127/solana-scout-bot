@@ -472,7 +472,12 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"  └ Vol 24h:  {_fmt_usd(opp.volume_24h_usd)}\n\n"
         f"📊 <b>Price Action</b>\n"
         f"  └ {opp.price_action_summary}\n\n"
-        f"⏱️ <b>Launch</b>: {launched_str}\n\n"
+        f"⏱️ <b>Launch</b>: {launched_str}\n"
+    + (
+        f"🎯 <b>Bonding</b>: {opp.bonding_label}\n"
+        if opp.pumpfun_bonding_progress > 0 else ""
+    )
+    + "\n"
         f"{safety_icon} <b>On-Chain Safety</b>\n"
         f"<pre>{html.escape(opp.safety_detail)}</pre>\n\n"
         f"{sentiment_emoji} <b>Sentiment: {opp.sentiment_label}</b>\n"
