@@ -61,6 +61,46 @@ executor = TradeExecutor()
 monitor = PositionMonitor(sentiment_analyzer)
 wallet_tracker = WalletTracker()
 
+# ── Trading window helpers ────────────────────────────────────────────────────
+
+import datetime as _dt
+
+def _get_wat_hour() -> int:
+    """Return current hour in West Africa Time (UTC+1)."""
+    return (_dt.datetime.utcnow().hour + 1) % 24
+
+
+def _get_trading_window() -> tuple[str, str, int]:
+    """
+    Returns (window_name, emoji, min_confidence_required).
+
+    Peak windows (WAT):
+      6PM–10PM  → evening peak, US + EU active, best signals
+      3AM–7AM   → Asia overlap, quiet but strong early moves
+
+    Dead zone (WAT):
+      11AM–2PM  → lowest volume, most fake pumps, raise confidence bar
+
+    All other hours → normal scanning
+    """
+    hour = _get_wat_hour()
+
+    # Evening peak — 18:00 to 22:00 WAT
+    if 18 <= hour < 22:
+        return "🔥 Evening Peak", "🔥", 4
+
+    # Asia overlap — 03:00 to 07:00 WAT
+    if 3 <= hour < 7:
+        return "🌏 Asia Window", "🌏", 4
+
+    # Dead zone — 11:00 to 14:00 WAT
+    if 11 <= hour < 14:
+        return "😴 Dead Zone", "😴", 7   # raise bar — require confidence ≥ 7
+
+    # Normal hours
+    return "🕐 Normal Hours", "🕐", 5
+
+
 # ── Auth guard ────────────────────────────────────────────────────────────────
 
 
@@ -435,7 +475,7 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
     entry_block = (
         f"{entry_emoji} <b>Entry Quality: {entry_grade} — {entry_label}</b>\n"
         f"<i>{html.escape(entry_explanation)}</i>\n"
-        f"<i>🕐 Alert time: {_wat_str}</i>\n\n"
+        f"<i>🕐 Alert time: {_wat_str} — {_get_trading_window()[0]}</i>\n\n"
     )
 
     # Only show narrative context when the tracker has been refreshed recently.
@@ -942,6 +982,19 @@ async def _run_scan_cycle(
                             f"on-chain not strong enough"
                         )
                         continue
+
+                # ── Time window confidence gate ───────────────────────────
+                # During dead hours (11AM–2PM WAT) only alert high conviction
+                # signals. During peak hours accept a lower confidence floor.
+                window_name, window_emoji, min_conf = _get_trading_window()
+                opp.confidence, opp.confidence_rationale = _compute_confidence(opp)
+
+                if opp.confidence < min_conf:
+                    logger.info(
+                        f"[Bot] {opp.symbol} skipped — confidence {opp.confidence}/10 "
+                        f"below {min_conf} required during {window_name}"
+                    )
+                    continue
 
                 # Build and send briefing
                 text, keyboard = _build_briefing(opp)
