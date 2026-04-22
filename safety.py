@@ -597,7 +597,104 @@ class SafetyChecker:
         else:
             description = ""
 
-        return risk, description
+        # Return buyer wallet list alongside risk so fresh wallet check can use it
+        return risk, description, list(buyer_amounts.keys())
+
+    async def _check_fresh_wallets(
+        self, buyer_wallets: list[str], token_created_ts: float = 0
+    ) -> tuple[float, str]:
+        """
+        Check if early buyers are fresh wallets — a major red flag for
+        coordinated launches and bundles.
+
+        Method:
+        - For each early buyer wallet, fetch their last 10 transactions
+        - If a wallet has fewer than 5 total transactions, it is brand new
+        - If multiple fresh wallets bought the same token = coordinated launch
+
+        Why this matters (from the guides):
+        - Fresh wallets funded from the same source buying at launch = bundle
+        - Real organic buyers have history — bots and coordinated wallets don't
+        - Multiple green leaf (fresh wallet) icons = instant red flag
+
+        Returns (risk_score, description)
+        0.0 = all wallets look organic
+        1.0 = highly coordinated fresh wallet attack
+        """
+        if not config.has_helius or not buyer_wallets:
+            return 0.0, ""
+
+        fresh_count   = 0
+        checked_count = 0
+        fresh_wallets = []
+
+        # Check up to 8 wallets to limit API calls
+        wallets_to_check = buyer_wallets[:8]
+
+        for wallet in wallets_to_check:
+            try:
+                result = await self._rpc_call(
+                    "getSignaturesForAddress",
+                    [wallet, {"limit": 10, "commitment": "confirmed"}]
+                )
+                checked_count += 1
+
+                if result is None:
+                    continue
+
+                tx_count = len(result)
+
+                # Wallet with fewer than 5 lifetime transactions = fresh
+                if tx_count < 5:
+                    fresh_wallets.append(wallet[:8])
+                    fresh_count += 1
+                    logger.debug(
+                        f"[Safety] Fresh wallet detected: {wallet[:8]}... "
+                        f"({tx_count} total txns)"
+                    )
+
+                # Small delay to avoid hammering RPC
+                await asyncio.sleep(0.15)
+
+            except Exception as e:
+                logger.debug(f"[Safety] Fresh wallet check error for {wallet[:8]}: {e}")
+                continue
+
+        if checked_count == 0 or fresh_count == 0:
+            return 0.0, ""
+
+        fresh_ratio = fresh_count / checked_count
+        risk        = 0.0
+        flags       = []
+
+        if fresh_count >= 4:
+            risk = 0.9
+            flags.append(
+                f"{fresh_count}/{checked_count} early buyers are fresh wallets "
+                f"(coordinated launch)"
+            )
+        elif fresh_count >= 3:
+            risk = 0.6
+            flags.append(
+                f"{fresh_count}/{checked_count} early buyers are fresh wallets"
+            )
+        elif fresh_count >= 2:
+            risk = 0.35
+            flags.append(
+                f"{fresh_count}/{checked_count} early buyers are fresh wallets "
+                f"(mild concern)"
+            )
+        elif fresh_count == 1:
+            risk = 0.15
+            flags.append("1 early buyer is a fresh wallet")
+
+        desc = " | ".join(flags) if flags else ""
+        if desc:
+            logger.info(
+                f"[Safety] Fresh wallet check: {desc} (risk={risk:.2f})"
+            )
+
+        return risk, desc
 
     async def full_safety_check(
         self, mint: str, pool_address: str = "", dex_name: str = "",
@@ -626,8 +723,23 @@ class SafetyChecker:
         lp_burned         = results[3] if not isinstance(results[3], Exception) else None
         extension_result  = results[4] if not isinstance(results[4], Exception) else ("unknown", [])
         pool_result       = results[5] if not isinstance(results[5], Exception) else ("unknown", 0.0, [])
-        bundle_result     = results[6] if not isinstance(results[6], Exception) else (0.0, "")
-        bundle_risk, bundle_desc = bundle_result if isinstance(bundle_result, tuple) else (0.0, "")
+        bundle_result = results[6] if not isinstance(results[6], Exception) else (0.0, "", [])
+        if isinstance(bundle_result, tuple) and len(bundle_result) == 3:
+            bundle_risk, bundle_desc, bundle_wallets = bundle_result
+        elif isinstance(bundle_result, tuple) and len(bundle_result) == 2:
+            bundle_risk, bundle_desc = bundle_result
+            bundle_wallets = []
+        else:
+            bundle_risk, bundle_desc, bundle_wallets = 0.0, "", []
+
+        # ── Fresh wallet check using early buyers from bundle detection ───────
+        fresh_risk   = 0.0
+        fresh_desc   = ""
+        if bundle_wallets:
+            try:
+                fresh_risk, fresh_desc = await self._check_fresh_wallets(bundle_wallets)
+            except Exception as e:
+                logger.debug(f"[Safety] Fresh wallet check error: {e}")
         deployer_result   = results[7] if not isinstance(results[7], Exception) else (0.0, "", "")
         if isinstance(deployer_result, tuple) and len(deployer_result) == 3:
             deployer_risk, deployer_desc, deployer_address = deployer_result
@@ -655,6 +767,15 @@ class SafetyChecker:
             pool_warnings.append(f"🚨 HIGH BUNDLE RISK: {bundle_desc}")
         elif bundle_risk >= 0.25 and bundle_desc:
             pool_warnings.append(f"⚠️ Bundle signals detected: {bundle_desc}")
+
+        # Fresh wallet warnings
+        if fresh_risk >= 0.6 and fresh_desc:
+            pool_warnings.append(f"🚨 FRESH WALLET ATTACK: {fresh_desc}")
+            pool_warnings.append(f"🚨 FRESH WALLETS (2nd flag): auto-fail")
+        elif fresh_risk >= 0.35 and fresh_desc:
+            pool_warnings.append(f"⚠️ Fresh wallets detected: {fresh_desc}")
+        elif fresh_risk > 0 and fresh_desc:
+            pool_warnings.append(f"ℹ️ {fresh_desc}")
 
         if deployer_risk >= 0.5 and deployer_desc:
             pool_warnings.append(f"🚨 SERIAL DEPLOYER: {deployer_desc}")
