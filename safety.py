@@ -129,7 +129,7 @@ class SafetyChecker:
     async def _check_mint_authority(self, mint: str) -> tuple[bool, bool]:
         result = await self._rpc_call("getAccountInfo", [mint, {"encoding": "base64"}])
         if not result or not result.get("value"):
-            return False, False
+            return False, True
         try:
             raw = base64.b64decode(result["value"]["data"][0])
             if len(raw) < 82:
@@ -331,8 +331,14 @@ class SafetyChecker:
             instant_fail = True
 
         if not freeze_renounced:
-            red_flags.append("🚨 Freeze authority ACTIVE — can freeze your tokens")
-            instant_fail = True
+            # Only instant-fail if Birdeye explicitly confirmed freeze is active.
+            # If we just couldn't check (RPC timeout), treat as a warning only.
+            if birdeye_data and birdeye_data.get("freezable") is True:
+                red_flags.append("🚨 Freeze authority ACTIVE (Birdeye confirmed)")
+                instant_fail = True
+            else:
+                # RPC couldn't verify — warn but don't kill
+                red_flags.append("⚠️ Freeze authority status unverified (RPC timeout)")
 
         # ── Soft warnings (contribute to red flag count, not instant fails) ────
         # Mint not renounced is now a WARNING only — many early legit tokens

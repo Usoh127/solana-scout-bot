@@ -265,6 +265,10 @@ class TokenScout:
                     headers={"Accept": "application/json"},
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
+                    if resp.status == 530:
+                        # Cloudflare rate limit / API down — skip silently
+                        logger.debug(f"[Scout] PumpFun {sort_by} → HTTP 530 (rate limited, skipping)")
+                        continue
                     if resp.status != 200:
                         logger.warning(f"[Scout] PumpFun {sort_by} → HTTP {resp.status}")
                         continue
@@ -289,8 +293,8 @@ class TokenScout:
                             coin.get("progress") or 0
                         )
 
-                        # Filter: too early (< 15%) = high rug risk, skip
-                        if bonding_progress < 15:
+                        # Filter: under 5% bonding = almost nothing traded yet, skip
+                        if bonding_progress < 5:
                             logger.debug(
                                 f"[Scout] Skipping {coin.get('symbol')} — "
                                 f"bonding only {bonding_progress:.0f}% (too early)"
