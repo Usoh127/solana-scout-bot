@@ -262,7 +262,10 @@ class TokenScout:
                         "limit":       50,
                         "includeNsfw": "false",
                     },
-                    headers={"Accept": "application/json"},
+                    headers={
+                        "Accept":     "application/json",
+                        "User-Agent": "Mozilla/5.0 (compatible; SolanaBot/1.0)",
+                    },
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status == 530:
@@ -293,12 +296,9 @@ class TokenScout:
                             coin.get("progress") or 0
                         )
 
-                        # Filter: under 5% bonding = almost nothing traded yet, skip
-                        if bonding_progress < 5:
-                            logger.debug(
-                                f"[Scout] Skipping {coin.get('symbol')} — "
-                                f"bonding only {bonding_progress:.0f}% (too early)"
-                            )
+                        # Only skip if bonding progress is literally 0
+                        # (means no data returned, not a real token)
+                        if bonding_progress == 0 and not coin.get("usd_market_cap"):
                             continue
 
                         # Filter: about to graduate (> 97%) = price already moved, skip
@@ -650,15 +650,15 @@ class TokenScout:
             return False, f"volume ${vol:,.0f} < min ${config.MIN_VOLUME_24H_USD:,.0f}"
 
         # ── NEW: Vol/MC ratio check ───────────────────────────────────────────
-        # Volume should be at least 30% of market cap.
+        # Volume should be at least 8% of market cap.
         # Below this = almost certainly bundled, wash-traded, or completely dead.
-        # Guide reference: below 80% = suspect. We use 30% as a practical floor.
+        # Guide reference: below 80% = suspect. We use 8% as a practical floor.
         # Skip for pump.fun (no real volume data available).
         if not is_pumpfun and mc > 0 and vol > 0:
             vol_mc_ratio = vol / mc
-            if vol_mc_ratio < 0.30:
+            if vol_mc_ratio < 0.08:
                 return False, (
-                    f"vol/MC ratio {vol_mc_ratio:.1%} < 30% — likely bundled or dead "
+                    f"vol/MC ratio {vol_mc_ratio:.1%} < 8% — dead or heavily bundled "
                     f"(vol ${vol:,.0f} vs MC ${mc:,.0f})"
                 )
 
