@@ -320,6 +320,7 @@ class SafetyChecker:
         birdeye_data:         dict | None,
         dangerous_extensions: list,
         pool_warnings:        list,
+        is_bonding_curve:     bool = False,   # True = pre-graduation pump.fun
     ) -> tuple[bool, list[str]]:
         red_flags    = []
         instant_fail = False
@@ -340,11 +341,26 @@ class SafetyChecker:
                 # RPC couldn't verify — warn but don't kill
                 red_flags.append("⚠️ Freeze authority status unverified (RPC timeout)")
 
-        # ── Soft warnings (contribute to red flag count, not instant fails) ────
-        # Mint not renounced is now a WARNING only — many early legit tokens
-        # haven't renounced yet. It shows in the briefing for your awareness.
+        # ── Mint authority check ──────────────────────────────────────────
+        # For bonding curve tokens (pre-graduation pump.fun):
+        #   Mint not renounced is EXPECTED — pump.fun burns it at graduation.
+        #   Show as a soft warning only.
+        # For graduated tokens (Pumpswap, Raydium, etc.):
+        #   Mint not renounced after graduation is a REAL red flag.
+        #   Pump.fun automatically revokes it at graduation — if it's still
+        #   active, something is wrong. Count it as a harder flag.
         if not mint_renounced:
-            red_flags.append("⚠️ Mint authority NOT renounced (infinite mint risk)")
+            if is_bonding_curve:
+                red_flags.append(
+                    "⚠️ Mint not renounced (expected pre-graduation — "
+                    "pump.fun burns this at graduation)"
+                )
+            else:
+                red_flags.append(
+                    "🚨 Mint authority NOT renounced — this token is already "
+                    "on a DEX, mint should have been burned at graduation"
+                )
+                instant_fail = True   # Hard fail for graduated tokens
 
         if top10_pct > config.MAX_TOP_10_HOLDER_PCT:
             red_flags.append(f"⚠️ Top-10 holders own {top10_pct:.1f}% (dump risk)")
@@ -704,7 +720,8 @@ class SafetyChecker:
 
     async def full_safety_check(
         self, mint: str, pool_address: str = "", dex_name: str = "",
-        volume_24h: float = 0.0, liquidity: float = 0.0, txns_24h: int = 0
+        volume_24h: float = 0.0, liquidity: float = 0.0, txns_24h: int = 0,
+        token_source: str = ""   # "pumpfun" = still on bonding curve
     ) -> SafetyResult:
         logger.info(f"[Safety] Running checks for {mint}")
         opp_volume_24h = volume_24h
@@ -802,9 +819,11 @@ class SafetyChecker:
         elif fake_vol_risk >= 0.2 and fake_vol_desc:
             pool_warnings.append(f"⚠️ Volume quality concern: {fake_vol_desc}")
 
+        is_bonding_curve = token_source == "pumpfun"
         is_honeypot, red_flags = self._check_honeypot_heuristics(
             mint_renounced, freeze_renounced, top10_pct,
             lp_burned, birdeye_data, dangerous_extensions, pool_warnings,
+            is_bonding_curve=is_bonding_curve,
         )
 
         checks = []

@@ -923,6 +923,8 @@ async def _run_scan_cycle(
                     volume_24h=opp.volume_24h_usd,
                     liquidity=opp.liquidity_usd,
                     txns_24h=opp.txns_24h,
+                    token_source=opp.dex if "pump" in opp.dex.lower() and
+                                 opp.pumpfun_bonding_progress > 0 else "",
                 )
                 opp.safety_passed = safety_result.passed
                 opp.safety_detail = safety_result.detail
