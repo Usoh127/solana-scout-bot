@@ -916,6 +916,18 @@ async def _run_scan_cycle(
         for opp in opportunities[:5]:  # Cap at 5 per cycle to avoid spam
             try:
                 # Safety check
+                # Detect bonding curve tokens by CA suffix OR source
+                # CAs ending in "pump" = pump.fun bonding curve
+                # CAs ending in "bonk" = bonkfun bonding curve
+                # Both are pre-graduation and mint not renounced is expected
+                _mint = opp.mint.lower()
+                _is_bonding = (
+                    _mint.endswith("pump") or
+                    _mint.endswith("bonk") or
+                    opp.pumpfun_bonding_progress > 0 or
+                    "pump.fun" in opp.dex.lower()
+                )
+
                 safety_result = await safety_checker.full_safety_check(
                     opp.mint,
                     opp.pool_address,
@@ -923,8 +935,7 @@ async def _run_scan_cycle(
                     volume_24h=opp.volume_24h_usd,
                     liquidity=opp.liquidity_usd,
                     txns_24h=opp.txns_24h,
-                    token_source=opp.dex if "pump" in opp.dex.lower() and
-                                 opp.pumpfun_bonding_progress > 0 else "",
+                    token_source="pumpfun" if _is_bonding else "",
                 )
                 opp.safety_passed = safety_result.passed
                 opp.safety_detail = safety_result.detail
