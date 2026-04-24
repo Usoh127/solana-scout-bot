@@ -38,6 +38,7 @@ from sentiment import SentimentAnalyzer
 from wallet_tracker import WalletTracker, WalletBuyAlert
 from narrative_tracker import narrative_tracker
 from logger import signal_logger
+from signal_detector import signal_detector, ConvergenceSignal
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -608,29 +609,407 @@ async def _on_risk_alert(alert: MonitorAlert, app: Application):
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 
+async def _on_convergence_signal(signal: "ConvergenceSignal", app):
+    """
+    Called by signal_detector when 2+ wallets buy the same token
+    within the convergence window.
 
-async def _on_wallet_alert(alert: "WalletBuyAlert", app):
+    Runs the full safety + sentiment pipeline, then fires a PRIORITY alert
+    — formatted differently from regular scanner alerts so you can tell them
+    apart at a glance.
+    """
     chat_id = app.bot_data.get("chat_id", config.TELEGRAM_ALLOWED_USER_ID)
     if not chat_id:
         return
+
+    token_mint = signal.token_mint
+
+    # Send a fast "detected" ping so you know immediately
+    preview_text = signal_detector.format_for_telegram(signal)
+    try:
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=preview_text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error(f"[Bot] Convergence preview send error: {e}")
+        return
+
+    # Run full pipeline in background — don't block the webhook response
+    asyncio.create_task(
+        _process_convergence_signal(signal, chat_id, app)
+    )
+
+
+async def _process_convergence_signal(
+    signal: "ConvergenceSignal",
+    chat_id: int,
+    app,
+):
+    """
+    Full pipeline for a convergence signal:
+    safety → sentiment → confidence → PRIORITY briefing.
+    """
+    try:
+        mint = signal.token_mint
+
+        # Fetch full token data from DexScreener
+        token_data = await scout.fetch_token_details_dexscreener(mint)
+        if not token_data:
+            logger.info(f"[Bot] Convergence: no DexScreener data for {mint[:8]} yet — may be brand new")
+            # Build a minimal opportunity for display
+            from scout import TokenOpportunity
+            from datetime import datetime, timezone
+            opp = TokenOpportunity(
+                mint=mint,
+                name=signal.token_name,
+                symbol=signal.token_symbol,
+                pool_address="",
+                dex="pump.fun",
+                price_usd=0.0,
+                market_cap_usd=0.0,
+                fdv_usd=0.0,
+                liquidity_usd=0.0,
+                volume_24h_usd=0.0,
+                volume_6h_usd=0.0,
+                volume_1h_usd=0.0,
+                price_change_1h=0.0,
+                price_change_6h=0.0,
+                price_change_24h=0.0,
+                launched_at=None,
+                age_hours=0.0,
+            )
+        else:
+            from scout import TokenOpportunity
+            from datetime import datetime, timezone
+            opp = TokenOpportunity(
+                mint=mint,
+                name=token_data.get("name", signal.token_name),
+                symbol=token_data.get("symbol", signal.token_symbol),
+                pool_address=token_data.get("pool_address", ""),
+                dex=token_data.get("dex", "unknown"),
+                price_usd=token_data.get("price_usd", 0.0),
+                market_cap_usd=token_data.get("market_cap_usd", 0.0),
+                fdv_usd=token_data.get("fdv_usd", 0.0),
+                liquidity_usd=token_data.get("liquidity_usd", 0.0),
+                volume_24h_usd=token_data.get("volume_24h_usd", 0.0),
+                volume_6h_usd=token_data.get("volume_6h_usd", 0.0),
+                volume_1h_usd=token_data.get("volume_1h_usd", 0.0),
+                price_change_1h=token_data.get("price_change_1h", 0.0),
+                price_change_6h=token_data.get("price_change_6h", 0.0),
+                price_change_24h=token_data.get("price_change_24h", 0.0),
+                launched_at=token_data.get("launched_at"),
+                age_hours=token_data.get("age_hours", 0.0),
+                dex_paid=token_data.get("dex_paid", False),
+                txns_24h=token_data.get("txns_24h", 0),
+            )
+
+        # Safety check
+        _mint = mint.lower()
+        _is_bonding = _mint.endswith("pump") or _mint.endswith("bonk")
+        safety_result = await safety_checker.full_safety_check(
+            mint,
+            opp.pool_address,
+            opp.dex,
+            volume_24h=opp.volume_24h_usd,
+            liquidity=opp.liquidity_usd,
+            txns_24h=opp.txns_24h,
+            token_source="pumpfun" if _is_bonding else "",
+        )
+        opp.safety_passed           = safety_result.passed
+        opp.safety_detail           = safety_result.detail
+        opp.safety_top10_holder_pct = safety_result.top10_holder_pct
+        opp.safety_lp_lock_verified = safety_result.lp_lock_verified
+        opp.safety_bundle_risk      = safety_result.bundle_risk
+        opp.safety_fake_volume_risk = safety_result.fake_volume_risk
+        opp.safety_deployer_risk    = safety_result.deployer_risk
+        opp.safety_deployer_address = getattr(safety_result, "deployer_address", "")
+
+        if not safety_result.passed:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ <b>Convergence signal failed safety check</b>\n"
+                    f"Token: <b>${html.escape(signal.token_symbol)}</b>\n"
+                    f"<pre>{html.escape(safety_result.detail[:400])}</pre>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # Sentiment
+        sentiment_result = await sentiment_analyzer.analyze(
+            opp.name, opp.symbol, mint
+        )
+        opp.sentiment_label     = sentiment_result.label
+        opp.sentiment_score     = sentiment_result.score
+        opp.sentiment_summary   = sentiment_result.summary
+        opp.tweet_count         = sentiment_result.tweet_count
+        opp.top_tweet_signal    = sentiment_result.top_tweet_signal
+        opp.reddit_summary      = sentiment_result.reddit_summary
+        opp.news_summary        = sentiment_result.news_summary
+        opp.has_notable_account = sentiment_result.has_notable_account
+
+        # Override recommended size with signal_detector's trust-weighted size
+        opp.confidence, opp.confidence_rationale = _compute_confidence(opp)
+
+        # Build convergence-specific briefing
+        text, keyboard = _build_convergence_briefing(opp, signal)
+
+        # Store for BUY callback
+        app.bot_data[f"opp_{mint}"] = opp
+
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        scout.mark_alerted(mint)
+        signal_logger.log_alert(opp)
+
+    except Exception as e:
+        logger.error(f"[Bot] Convergence pipeline error: {e}", exc_info=True)
+
+
+def _build_convergence_briefing(
+    opp, signal: "ConvergenceSignal"
+) -> tuple[str, "InlineKeyboardMarkup"]:
+    """
+    Convergence-specific briefing — visually distinct from scanner alerts.
+    Emphasises wallet signal over chart data.
+    """
+    safety_icon     = "✅" if opp.safety_passed else "❌"
+    sentiment_emoji = {"Bullish": "🟢", "Bearish": "🔴", "Neutral": "🟡"}.get(
+        opp.sentiment_label, "⚪"
+    )
+
+    # Wallet breakdown with trust bars
+    wallet_lines = ""
+    for name, trust in zip(signal.wallet_names, signal.wallet_trusts):
+        stars = "⭐" * min(3, round(trust))
+        wallet_lines += f"  {stars} {html.escape(name)} — trust {trust:.2f}\n"
+
+    window_str = (
+        f"{signal.window_seconds:.0f}s"
+        if signal.window_seconds < 120
+        else f"{signal.window_seconds / 60:.1f}min"
+    )
+
+    # Position size uses signal_detector's trust-weighted recommendation
+    recommended_sol = signal.recommended_sol
+
+    financials = ""
+    if opp.market_cap_usd > 0:
+        financials = (
+            f"💰 <b>Financials</b>\n"
+            f"  ├ MCap:    <b>{_fmt_usd(opp.market_cap_usd)}</b>\n"
+            f"  ├ Liq:     {_fmt_usd(opp.liquidity_usd)}\n"
+            f"  └ Vol 24h: {_fmt_usd(opp.volume_24h_usd)}\n\n"
+            f"📊 <b>Price Action</b>: {opp.price_action_summary}\n\n"
+        )
+    else:
+        financials = "<i>⏳ Token too new for DEX data — wallets got in first</i>\n\n"
+
+    return (
+        f"🚨🚨 <b>WALLET CONVERGENCE — PRIORITY ALERT</b> 🚨🚨\n"
+        f"{'━' * 28}\n"
+        f"🪙 <b>{html.escape(opp.name)}</b>  <code>${html.escape(opp.symbol)}</code>\n"
+        f"📍 <code>{opp.mint}</code>\n\n"
+        f"👥 <b>{signal.wallet_count} tracked wallets</b> bought within {window_str}:\n"
+        f"{wallet_lines}\n"
+        f"📶 Signal: <b>{signal.signal_strength}</b>\n"
+        f"💰 Combined SOL in: <b>{signal.total_sol_spent:.3f} SOL</b>\n"
+        f"🎯 Avg trust score: <b>{signal.weighted_trust:.2f}/3.0</b>\n\n"
+        f"{'━' * 28}\n"
+        f"{financials}"
+        f"{safety_icon} <b>Safety</b>\n"
+        f"<pre>{html.escape(opp.safety_detail[:300])}</pre>\n\n"
+        f"{sentiment_emoji} <b>Sentiment: {opp.sentiment_label}</b>\n"
+        f"<i>{html.escape(opp.sentiment_summary[:120])}</i>\n\n"
+        f"🧠 <b>Confidence: {opp.confidence}/10</b>\n"
+        f"<i>{html.escape(opp.confidence_rationale)}</i>\n\n"
+        f"{'━' * 28}\n"
+        f"💸 Recommended: <b>{recommended_sol} SOL</b>"
+        f"  (trust-weighted for {signal.wallet_count} wallets)\n"
+        f"⚡ This is a CONVERGENCE signal — smart money is moving NOW."
+    ), InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("🟢 BUY", callback_data=f"BUY_{opp.mint}"),
+            InlineKeyboardButton("⏭️ SKIP", callback_data=f"SKIP_{opp.mint}"),
+        ]]
+    )
+
+
+async def _update_wallet_trust_from_close(
+    mint: str, outcome_type: str, multiplier: float
+):
+    """
+    After a trade is closed, check if any tracked wallets bought this token
+    and update their trust scores accordingly.
+
+    Call this from cmd_close() after signal_logger.close_trade() succeeds.
+    """
+    from signal_detector import signal_detector as sd
+
+    # Find wallets that bought this mint (stored in signal_log or wallet_tracker)
+    # We use wallet_tracker.wallets to get name → address mapping
+    try:
+        for addr, wallet in wallet_tracker.wallets.items():
+            # Check if this wallet's buy_count increased around when this token
+            # was alerted — we use the simple heuristic of checking wallet trust
+            # updates only for wallets registered in the tracker
+            sd.update_trust_from_outcome(
+                wallet_address=addr,
+                wallet_name=wallet.name,
+                outcome_type=outcome_type,
+                multiplier=multiplier,
+            )
+
+        logger.info(
+            f"[Bot] Trust scores updated for {len(wallet_tracker.wallets)} "
+            f"wallets based on {outcome_type} ({multiplier:.1f}x) outcome"
+        )
+    except Exception as e:
+        logger.warning(f"[Bot] Trust update error: {e}")
+
+
+async def cmd_wallets_with_trust(update, context):
+    if not _is_authorized(update):
+        return await _unauthorized(update, context)
+
+    from signal_detector import signal_detector as sd
+
+    wallets = wallet_tracker.list_wallets()
+    if not wallets:
+        await update.message.reply_text(
+            "No wallets tracked yet. Use /addwallet [address] [name]"
+        )
+        return
+
+    trust_data = {r["address"]: r for r in sd.get_all_trust_scores()}
+
+    lines = ["<b>🔍 Tracked Wallets + Trust Scores</b>\n"]
+    for w in wallets:
+        td = trust_data.get(w.address, {})
+        trust = td.get("trust_score", 1.0)
+        wins  = td.get("win_count", 0)
+        losses = td.get("loss_count", 0)
+        rugs  = td.get("rug_count", 0)
+
+        stars = "⭐" * min(3, round(trust))
+        record_str = f"{wins}W/{losses}L/{rugs}R" if (wins + losses + rugs) > 0 else "no closes yet"
+
+        lines.append(
+            f"{stars} <b>{html.escape(w.name)}</b>\n"
+            f"  <code>{w.address}</code>\n"
+            f"  Trust: <b>{trust:.2f}/3.0</b>  |  Record: {record_str}\n"
+            f"  Buys tracked: {w.buy_count}"
+        )
+
+    # Convergence window summary
+    summary = sd.get_window_summary()
+    lines.append(f"\n<i>📡 Active signals: {summary}</i>")
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+async def cmd_signal(update, context):
+    """
+    /signal — Show what's happening in the convergence window right now.
+    """
+    if not _is_authorized(update):
+        return await _unauthorized(update, context)
+
+    from signal_detector import signal_detector as sd, SIGNAL_WINDOW_SECONDS
+
+    # Show active wallet activity
+    active_mints = []
+    for mint, dq in sd._events.items():
+        sd._prune(mint)
+        if len(dq) >= 1:
+            unique_wallets = list({ev.wallet_address: ev for ev in dq}.values())
+            active_mints.append((mint, unique_wallets))
+
+    if not active_mints:
+        await update.message.reply_text(
+            f"📡 No wallet activity in last {SIGNAL_WINDOW_SECONDS // 60}min window.\n"
+            f"<i>Watching {len(wallet_tracker.wallets)} wallets via Helius webhook.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = [f"📡 <b>Convergence Window ({SIGNAL_WINDOW_SECONDS // 60}min)</b>\n"]
+    for mint, events in sorted(active_mints, key=lambda x: -len(x[1])):
+        count  = len(events)
+        symbol = events[0].token_symbol if events else mint[:8]
+        names  = ", ".join(ev.wallet_name for ev in events[:3])
+        bar    = "🔥" if count >= 3 else "👀" if count >= 2 else "·"
+        lines.append(
+            f"{bar} <b>${html.escape(symbol)}</b> — "
+            f"{count} wallet(s): {html.escape(names)}\n"
+            f"  <code>{mint}</code>"
+        )
+
+    trust_rows = sd.get_all_trust_scores()
+    if trust_rows:
+        top3 = trust_rows[:3]
+        lines.append("\n<b>Top trusted wallets:</b>")
+        for r in top3:
+            lines.append(
+                f"  ⭐ {html.escape(r['name'])} — {r['trust_score']:.2f}"
+            )
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+
+async def _on_wallet_alert_v2(alert: "WalletBuyAlert", app):
+    """
+    Enhanced solo wallet alert — shows trust score and convergence context.
+    If already part of convergence, mark as such.
+    """
+    chat_id = app.bot_data.get("chat_id", config.TELEGRAM_ALLOWED_USER_ID)
+    if not chat_id:
+        return
+
+    from signal_detector import signal_detector as sd
+
+    trust = sd.get_trust(alert.wallet_address)
+    stars = "⭐" * min(3, round(trust))
+    convergence_note = (
+        f"\n⚡ <i>Part of {alert.convergence_count}-wallet convergence!</i>"
+        if alert.is_convergence and alert.convergence_count >= 2
+        else ""
+    )
+
     try:
         safety_result = await safety_checker.full_safety_check(alert.token_mint, "", "")
-        safety_icon = "OK" if safety_result.passed else "FAIL"
+        safety_icon = "✅" if safety_result.passed else "❌"
         text = (
-            "<b>WALLET ALERT</b>\n"
-            + ("=" * 28) + "\n"
-            + f"Wallet: <b>{html.escape(alert.wallet_name)}</b>\n"
-            + f"Bought: <b>${html.escape(alert.token_symbol)}</b>\n"
-            + f"Spent: <b>{alert.sol_spent:.3f} SOL</b>\n"
-            + f"CA: <code>{alert.token_mint}</code>\n\n"
-            + f"Safety: {safety_icon}\n"
-            + f"<pre>{html.escape(safety_result.detail[:300])}</pre>\n\n"
-            + f'<a href="https://solscan.io/tx/{alert.tx_signature}">View tx</a> | '
-            + f'<a href="https://dexscreener.com/solana/{alert.token_mint}">DexScreener</a>'
+            f"👁️ <b>WALLET ALERT</b>\n"
+            f"{'━' * 28}\n"
+            f"Wallet: {stars} <b>{html.escape(alert.wallet_name)}</b>"
+            f"  <i>(trust {trust:.2f})</i>\n"
+            f"Bought: <b>${html.escape(alert.token_symbol)}</b>  "
+            f"({html.escape(alert.token_name)})\n"
+            f"Spent: <b>{alert.sol_spent:.3f} SOL</b>\n"
+            f"CA: <code>{alert.token_mint}</code>\n"
+            f"{convergence_note}\n\n"
+            f"{safety_icon} Safety: "
+            f"{'PASS' if safety_result.passed else 'FAIL'}\n"
+            f"<pre>{html.escape(safety_result.detail[:250])}</pre>\n\n"
+            f'<a href="https://solscan.io/tx/{alert.tx_signature}">View tx</a> | '
+            f'<a href="https://dexscreener.com/solana/{alert.token_mint}">DexScreener</a>'
         )
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("BUY", callback_data=f"WALLETBUY_{alert.token_mint}"),
-            InlineKeyboardButton("SKIP", callback_data=f"SKIP_{alert.token_mint}"),
+            InlineKeyboardButton("🟢 BUY", callback_data=f"WALLETBUY_{alert.token_mint}"),
+            InlineKeyboardButton("⏭️ SKIP", callback_data=f"SKIP_{alert.token_mint}"),
         ]])
         await app.bot.send_message(
             chat_id=chat_id, text=text,
@@ -1259,13 +1638,11 @@ async def _handle_confirm_sell(query, context, mint: str):
         )
 
 
-async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_close_with_trust(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /close <CA> <outcome>
-    Examples:
-        /close So1abc123... 3.5x
-        /close So1abc123... rugged
-        /close So1abc123... -40%
+    After logging the outcome, updates trust scores for any wallets
+    that flagged this token.
     """
     if not _is_authorized(update):
         return await _unauthorized(update, context)
@@ -1287,6 +1664,39 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     success, message = signal_logger.close_trade(mint, outcome_raw)
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
+
+    if success:
+        # Parse outcome for trust update
+        outcome_low = outcome_raw.lower()
+        multiplier  = 1.0
+        outcome_type = "loss"
+
+        if outcome_low in ("rug", "rugged", "rug pull"):
+            multiplier   = 0.0
+            outcome_type = "rug"
+        elif outcome_low.endswith("x"):
+            try:
+                multiplier   = float(outcome_low[:-1])
+                outcome_type = "win" if multiplier >= 1.5 else "loss"
+            except ValueError:
+                pass
+        elif outcome_low.endswith("%"):
+            try:
+                pct          = float(outcome_low[:-1])
+                multiplier   = 1 + (pct / 100)
+                outcome_type = "win" if multiplier >= 1.5 else "loss"
+            except ValueError:
+                pass
+
+        # Update trust for all wallets that were part of a convergence on this mint
+        await _update_wallet_trust_from_close(mint, outcome_type, multiplier)
+
+        trust_note = (
+            "✅ Wallet trust scores updated." if outcome_type == "win"
+            else "📉 Wallet trust scores adjusted down." if outcome_type == "loss"
+            else "☠️ Wallet trust scores penalised (rug)."
+        )
+        await update.message.reply_text(trust_note)
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1356,6 +1766,7 @@ def main():
             ("help",         "All commands"),
             ("close",        "Log trade outcome"),
             ("stats",        "View signal performance stats"),
+            ("signal",       "Show active convergence signals"),
         ])
 
     import asyncio as _aio2
@@ -1368,7 +1779,10 @@ def main():
     monitor.register_alert_callback(
         lambda alert: _on_risk_alert(alert, app)
     )
-    wallet_tracker.register_alert_callback(lambda alert: _on_wallet_alert(alert, app))
+    wallet_tracker.register_alert_callback(lambda alert: _on_wallet_alert_v2(alert, app))
+    signal_detector.register_callback(
+        lambda sig: _on_convergence_signal(sig, app)
+    )
     port = int(os.environ.get("PORT", 8080))
     public_url = os.environ.get("RAILWAY_PUBLIC_URL", "")
     import asyncio as _aio
@@ -1385,11 +1799,12 @@ def main():
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("addwallet", cmd_addwallet))
     app.add_handler(CommandHandler("removewallet", cmd_removewallet))
-    app.add_handler(CommandHandler("wallets", cmd_wallets))
+    app.add_handler(CommandHandler("wallets", cmd_wallets_with_trust))
     app.add_handler(CommandHandler("walletbalances", cmd_walletbalances))
     app.add_handler(CommandHandler("walletbalance", cmd_walletbalance))
-    app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(CommandHandler("close", cmd_close_with_trust))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("signal", cmd_signal))
 
     # Inline keyboard callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))

@@ -1,11 +1,14 @@
 """
 wallet_tracker.py — Alpha wallet tracking via Helius webhooks.
 
+v2 — Convergence-aware upgrade.
+
 Monitors a list of known profitable wallets for SWAP transactions.
 When a tracked wallet buys a token:
   1. Extract the token mint from the swap
-  2. Run full safety check
-  3. Fire a Telegram alert with wallet name + token details
+  2. Feed into signal_detector.record_buy()
+  3. If convergence threshold met → fire convergence alert (priority)
+  4. Otherwise fire a solo wallet alert as before
 
 Architecture:
   - Helius webhook POSTs to /webhook on our Railway URL
@@ -22,8 +25,6 @@ Setup:
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -72,6 +73,9 @@ class WalletBuyAlert:
     sol_spent:      float
     tx_signature:   str
     detected_at:    float = field(default_factory=time.time)
+    # Convergence context — populated if part of a multi-wallet signal
+    is_convergence: bool  = False
+    convergence_count: int = 0
 
 
 # ─── WalletTracker ────────────────────────────────────────────────────────────
@@ -87,6 +91,18 @@ class WalletTracker:
 
         # Load saved wallets
         self._load_wallets()
+
+        # Wire up signal detector (lazy import to avoid circular)
+        self._signal_detector = None
+
+    def _get_signal_detector(self):
+        if self._signal_detector is None:
+            try:
+                from signal_detector import signal_detector
+                self._signal_detector = signal_detector
+            except ImportError:
+                pass
+        return self._signal_detector
 
     # ── Session ───────────────────────────────────────────────────────────────
 
@@ -479,7 +495,8 @@ class WalletTracker:
     async def handle_webhook(self, request: web.Request) -> web.Response:
         """
         Receives POST from Helius when a tracked wallet transacts.
-        Verifies auth, parses the swap, fires alert if it's a new token buy.
+        Verifies auth, parses the swap, feeds into signal_detector,
+        fires alert if it's a new token buy.
         """
         # Verify it's really Helius
         auth = request.headers.get("Authorization", "")
@@ -527,6 +544,31 @@ class WalletTracker:
                             f"${alert.token_symbol} ({alert.token_name}) "
                             f"— {alert.sol_spent:.3f} SOL"
                         )
+
+                        # ── Feed into convergence detector ─────────────────
+                        sd = self._get_signal_detector()
+                        if sd is not None:
+                            from signal_detector import BuyEvent
+                            buy_event = BuyEvent(
+                                wallet_address = alert.wallet_address,
+                                wallet_name    = alert.wallet_name,
+                                token_mint     = alert.token_mint,
+                                token_symbol   = alert.token_symbol,
+                                token_name     = alert.token_name,
+                                sol_spent      = alert.sol_spent,
+                                tx_signature   = alert.tx_signature,
+                            )
+                            # record_buy fires convergence callbacks if threshold met
+                            convergence = await sd.record_buy(buy_event)
+                            if convergence:
+                                # Mark alert as part of convergence so solo
+                                # alert doesn't double-fire
+                                alert.is_convergence = True
+                                alert.convergence_count = convergence.wallet_count
+                                # Convergence callback handles its own Telegram alert
+                                # via the registered callback in bot.py
+                                # Solo alert still fires for each wallet individually
+                        # ── Fire solo wallet alert ─────────────────────────
                         await self._fire_alert(alert)
 
             except Exception as e:
@@ -580,6 +622,19 @@ class WalletTracker:
                                     alert.token_name,
                                 )
                             )
+                            # Feed into convergence detector
+                            sd = self._get_signal_detector()
+                            if sd is not None:
+                                from signal_detector import BuyEvent
+                                await sd.record_buy(BuyEvent(
+                                    wallet_address=alert.wallet_address,
+                                    wallet_name=alert.wallet_name,
+                                    token_mint=alert.token_mint,
+                                    token_symbol=alert.token_symbol,
+                                    token_name=alert.token_name,
+                                    sol_spent=alert.sol_spent,
+                                    tx_signature=alert.tx_signature,
+                                ))
                             alerts.append(alert)
 
             except Exception as e:
