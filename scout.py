@@ -34,6 +34,8 @@ import aiohttp
 
 from config import config
 from narrative_tracker import narrative_tracker
+from narrative_scout import narrative_scout, NarrativeCandidate
+from early_detector import holder_velocity, is_very_young, should_bypass_social_gate
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +135,22 @@ class TokenOpportunity:
     pumpfun_reply_count: int = 0
     pumpfun_is_koth: bool = False
     pumpfun_bonding_progress: float = 0.0   # 0-100, how far to graduation
+
+    # Narrative discovery fields
+    narrative_theme:   str   = ""    # e.g. "AI / Agents"
+    narrative_heat:    str   = ""    # "hot" / "rising" / "cooling"
+    narrative_keyword: str   = ""    # keyword that matched
+    is_very_young:     bool  = False # under 20 min — bypass social gate
+
+    # Holder velocity
+    holder_velocity_pct: float = 0.0
+    holder_velocity_str: str   = ""
+
+    # Deployer track record
+    deployer_win_count:  int   = 0
+    deployer_total:      int   = 0
+    deployer_win_bonus:  int   = 0
+    deployer_win_detail: str   = ""
 
     first_seen: float = field(default_factory=time.time)
 
@@ -669,6 +687,17 @@ class TokenScout:
         if age > config.MAX_TOKEN_AGE_HOURS:
             return False, f"age {age:.1f}h > max {config.MAX_TOKEN_AGE_HOURS}h"
 
+        # PRIMARY scan: tokens under 6 hours only
+        # SECONDARY: allow older tokens only if they have exceptional signals
+        PRIMARY_MAX_AGE = 6.0
+        if age > PRIMARY_MAX_AGE:
+            # Older tokens need exceptional price action to qualify
+            if p1h < 50 and not is_pumpfun:
+                return False, (
+                    f"age {age:.1f}h > {PRIMARY_MAX_AGE}h primary window "
+                    f"(needs 50%+ 1h momentum to override)"
+                )
+
         # Price change: skip for pump.fun
         if not is_pumpfun and p1h < config.MIN_PRICE_CHANGE_1H:
             return False, f"1h price change {p1h:.1f}% < min {config.MIN_PRICE_CHANGE_1H}%"
@@ -743,13 +772,17 @@ class TokenScout:
     async def scan_for_opportunities(self) -> list[TokenOpportunity]:
         logger.info("[Scout] Starting scan cycle…")
 
-        pump_task  = asyncio.create_task(self._fetch_pumpfun_new())
-        gecko_task = asyncio.create_task(self._fetch_gecko_new_pools())
-        dex_task   = asyncio.create_task(self._fetch_dexscreener_trending())
-        bird_task  = asyncio.create_task(self._fetch_birdeye_trending())
+        pump_task      = asyncio.create_task(self._fetch_pumpfun_new())
+        gecko_task     = asyncio.create_task(self._fetch_gecko_new_pools())
+        dex_task       = asyncio.create_task(self._fetch_dexscreener_trending())
+        bird_task      = asyncio.create_task(self._fetch_birdeye_trending())
+        narrative_task = asyncio.create_task(narrative_scout.scan())
 
-        pump_results, gecko_results, dex_results, bird_results = await asyncio.gather(
-            pump_task, gecko_task, dex_task, bird_task, return_exceptions=True
+        pump_results, gecko_results, dex_results, bird_results, narrative_results = (
+            await asyncio.gather(
+                pump_task, gecko_task, dex_task, bird_task, narrative_task,
+                return_exceptions=True
+            )
         )
 
         raw: list[dict] = []
@@ -758,6 +791,37 @@ class TokenScout:
                 raw.extend(result)
             elif isinstance(result, Exception):
                 logger.warning(f"[Scout] Source error: {result}")
+
+        # Convert narrative candidates to dict format compatible with dedup
+        if isinstance(narrative_results, list):
+            for nc in narrative_results:
+                raw.append({
+                    "mint":                    nc.mint,
+                    "name":                    nc.name,
+                    "symbol":                  nc.symbol,
+                    "pool_address":            nc.pool_address,
+                    "dex":                     nc.dex,
+                    "price_usd":               nc.price_usd,
+                    "market_cap_usd":          nc.market_cap_usd,
+                    "fdv_usd":                 nc.market_cap_usd,
+                    "liquidity_usd":           nc.liquidity_usd,
+                    "volume_24h_usd":          nc.volume_24h_usd,
+                    "volume_6h_usd":           nc.volume_6h_usd,
+                    "volume_1h_usd":           nc.volume_1h_usd,
+                    "price_change_1h":         nc.price_change_1h,
+                    "price_change_6h":         nc.price_change_6h,
+                    "price_change_24h":        nc.price_change_24h,
+                    "launched_at":             nc.launched_at,
+                    "age_hours":               nc.age_hours,
+                    "source":                  "narrative",
+                    "narrative_theme":         nc.matched_theme,
+                    "narrative_heat":          nc.narrative_heat,
+                    "narrative_keyword":       nc.matched_keyword,
+                    "is_very_young":           nc.is_very_young,
+                    "pumpfun_bonding_progress": nc.bonding_progress,
+                })
+        elif isinstance(narrative_results, Exception):
+            logger.warning(f"[Scout] Narrative scout error: {narrative_results}")
 
         raw = self._dedup(raw)
         logger.info(f"[Scout] {len(raw)} unique tokens after dedup")
@@ -813,6 +877,16 @@ class TokenScout:
                 pumpfun_is_koth=t.get("pumpfun_is_koth", False),
                 pumpfun_bonding_progress=t.get("pumpfun_bonding_progress", 0.0),
             )
+            # Record holder count snapshot for velocity tracking on next cycle
+            # (holder count comes from safety check later, but we can snapshot mcap
+            #  as a proxy — actual holder recording happens after safety check)
+            if t.get("source") == "narrative":
+                opp.data_only_call   = t.get("is_very_young", False)
+                opp.data_only_reason = (
+                    f"Narrative match: {t.get('narrative_theme', '')} "
+                    f"({t.get('narrative_heat', '')}), "
+                    f"keyword: {t.get('narrative_keyword', '')}"
+                )
             opportunities.append(opp)
 
         logger.info(f"[Scout] {len(opportunities)} opportunities passed thresholds")

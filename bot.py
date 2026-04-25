@@ -39,6 +39,8 @@ from wallet_tracker import WalletTracker, WalletBuyAlert
 from narrative_tracker import narrative_tracker
 from logger import signal_logger
 from signal_detector import signal_detector, ConvergenceSignal
+from early_detector import should_bypass_social_gate, holder_velocity, deployer_checker
+from narrative_scout import narrative_scout
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -242,6 +244,33 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score -= 1
         penalties.append("⚠️ deployer pattern risk")
 
+    # Deployer win-rate bonus/penalty
+    dep_bonus  = getattr(opp, "deployer_win_bonus", 0)
+    dep_detail = getattr(opp, "deployer_win_detail", "")
+    if dep_bonus > 0:
+        score += dep_bonus
+        reasons.append(dep_detail)
+    elif dep_bonus < 0:
+        score += dep_bonus   # it's negative, so this subtracts
+        penalties.append(dep_detail)
+
+    # Narrative heat bonus
+    if getattr(opp, "narrative_heat", "") == "hot":
+        score += 1
+        reasons.append(f"🔥 hot narrative: {opp.narrative_theme}")
+    elif getattr(opp, "narrative_heat", "") == "rising":
+        score += 1
+        reasons.append(f"📈 rising narrative: {opp.narrative_theme}")
+
+    # Holder velocity bonus
+    vel_pct = getattr(opp, "holder_velocity_pct", 0.0)
+    if vel_pct >= 0.50:
+        score += 2
+        reasons.append("🚀 holder count exploding")
+    elif vel_pct >= 0.30:
+        score += 1
+        reasons.append("📈 strong holder velocity")
+
     score = max(1, min(10, score))
     rationale = " · ".join((reasons[:2] + penalties[:2]))
     return score, rationale
@@ -421,6 +450,31 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
             f"<i>Reason: {html.escape(opp.data_only_reason)}</i>\n"
         )
 
+    # Narrative discovery badge
+    narrative_block = ""
+    if getattr(opp, "narrative_theme", ""):
+        heat_emoji = (
+            "🔥" if opp.narrative_heat == "hot" else
+            "📈" if opp.narrative_heat == "rising" else "📊"
+        )
+        narrative_block = (
+            f"\n{heat_emoji} <b>Found via narrative:</b> "
+            f"{html.escape(opp.narrative_theme)} "
+            f"(keyword: <i>{html.escape(opp.narrative_keyword)}</i>)\n"
+        )
+
+    # Holder velocity badge
+    velocity_block = ""
+    vel_str = getattr(opp, "holder_velocity_str", "")
+    if vel_str:
+        velocity_block = f"\n👥 <b>Holder velocity:</b> {html.escape(vel_str)}\n"
+
+    # Deployer track record badge
+    deployer_win_block = ""
+    dep_detail = getattr(opp, "deployer_win_detail", "")
+    if dep_detail:
+        deployer_win_block = f"\n{html.escape(dep_detail)}\n"
+
     # Copycat warning block
     copycat_block = ""
     if hasattr(opp, "possible_copycat") and opp.possible_copycat:
@@ -505,7 +559,10 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         + f"🏊 DEX: {html.escape(opp.dex.title())}"
         + ("  📊 <b>DEX Enhanced Paid</b>" if hasattr(opp, "dex_paid") and opp.dex_paid else "")
         + "\n\n"
-        f"💰 <b>Financials</b>\n"
+        + narrative_block
+        + velocity_block
+        + deployer_win_block
+        + f"💰 <b>Financials</b>\n"
         f"  ├ Price:    <code>${opp.price_usd:.8f}</code>\n"
         f"  ├ MCap:     <b>{_fmt_usd(opp.market_cap_usd)}</b>\n"
         f"  ├ FDV:      {_fmt_usd(opp.fdv_usd)}\n"
@@ -1250,8 +1307,11 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Save chat_id
     context.bot_data["chat_id"] = update.effective_chat.id
 
+    themes_summary = narrative_scout.get_current_themes_summary()
     msg = await update.message.reply_text(
-        "🔍 Scanning Solana DEXs… hang tight"
+        f"🔍 Scanning Solana DEXs + hunting narratives…\n"
+        f"<i>Active: {themes_summary}</i>",
+        parse_mode=ParseMode.HTML,
     )
     await _run_scan_cycle(context, chat_id=update.effective_chat.id, status_msg=msg)
 
@@ -1327,6 +1387,20 @@ async def _run_scan_cycle(
                     safety_result, "deployer_address", ""
                 )
 
+                # Check deployer win-rate (async, uses 24h cache)
+                if opp.safety_deployer_address:
+                    dep_record = await deployer_checker.check(opp.safety_deployer_address)
+                    if dep_record:
+                        bonus, detail = dep_record.confidence_bonus()
+                        opp.deployer_win_count  = dep_record.wins
+                        opp.deployer_total      = dep_record.total
+                        opp.deployer_win_bonus  = bonus
+                        opp.deployer_win_detail = detail
+                        if detail:
+                            logger.info(
+                                f"[Bot] {opp.symbol} deployer: {detail}"
+                            )
+
                 if not safety_result.passed:
                     logger.info(
                         f"[Bot] {opp.symbol} failed safety check — skipping"
@@ -1349,29 +1423,42 @@ async def _run_scan_cycle(
 
                 # Social signal gate — relaxed for young tokens
                 if not sentiment_result.has_any_signal:
-                    vol_liq = opp.volume_24h_usd / opp.liquidity_usd if opp.liquidity_usd > 0 else 0
-                    # Young tokens (<2h) rarely have social signal yet — don't penalise them
-                    is_young = opp.age_hours < 2.0
+                    # Check if this token should bypass the social gate
+                    bypass, bypass_reason = should_bypass_social_gate(
+                        opp.age_hours, opp.price_change_1h
+                    )
+
+                    # Narrative-found tokens always bypass if very young
+                    if opp.is_very_young or (opp.narrative_theme and opp.age_hours < 1.0):
+                        bypass        = True
+                        bypass_reason = (
+                            f"Narrative match ({opp.narrative_theme}) — "
+                            f"too young for CT posts ({opp.age_hours * 60:.0f}min old)"
+                        )
+
+                    vol_liq = (
+                        opp.volume_24h_usd / opp.liquidity_usd
+                        if opp.liquidity_usd > 0 else 0
+                    )
                     is_exceptional = (
-                        opp.price_change_1h >= 20          # lowered from 100%
-                        and vol_liq >= 1.5                 # lowered from 3x
+                        opp.price_change_1h >= 20 and vol_liq >= 1.5
                         and opp.liquidity_usd >= config.MIN_LIQUIDITY_USD
                     )
-                    if is_young or is_exceptional:
-                        opp.data_only_call = True
-                        opp.data_only_reason = (
-                            f"{'Young token ' + opp.age_str + ', ' if is_young else ''}"
+
+                    if bypass or is_exceptional:
+                        opp.data_only_call   = True
+                        opp.data_only_reason = bypass_reason or (
                             f"{opp.price_change_1h:.0f}% 1h, "
                             f"{vol_liq:.1f}x vol/liq — no social data yet"
                         )
                         logger.info(
                             f"[Bot] {opp.symbol} — no social signal, surfacing as "
-                            f"DATA-ONLY ({'young' if is_young else 'exceptional on-chain'})"
+                            f"DATA-ONLY ({bypass_reason or 'exceptional on-chain'})"
                         )
                     else:
                         logger.info(
                             f"[Bot] {opp.symbol} skipped — no social signal, "
-                            f"on-chain not strong enough"
+                            f"not young enough or exceptional"
                         )
                         continue
 
