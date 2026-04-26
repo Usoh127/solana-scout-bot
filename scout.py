@@ -135,6 +135,8 @@ class TokenOpportunity:
     pumpfun_reply_count: int = 0
     pumpfun_is_koth: bool = False
     pumpfun_bonding_progress: float = 0.0   # 0-100, how far to graduation
+    rugcheck_score:   int  = -1
+    rugcheck_summary: str  = ""
 
     # Narrative discovery fields (set when found via narrative_scout)
     narrative_theme:   str  = ""   # e.g. "AI / Agents", "Dogs"

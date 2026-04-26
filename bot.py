@@ -587,7 +587,9 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
     )
     + "\n"
         f"{safety_icon} <b>On-Chain Safety</b>\n"
-        f"<pre>{html.escape(opp.safety_detail)}</pre>\n\n"
+        f"<pre>{html.escape(opp.safety_detail)}</pre>\n"
+        + (f"🔍 {html.escape(opp.rugcheck_summary)}\n" if getattr(opp, 'rugcheck_summary', '') else "")
+        + "\n"
         f"{sentiment_emoji} <b>Sentiment: {opp.sentiment_label}</b>\n"
         f"{twitter_block}"
         f"{reddit_block}"

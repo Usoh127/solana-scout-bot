@@ -8,6 +8,7 @@ Checks in order of reliability:
   4. LP burn check via pool account inspection
   5. SPL-Token-2022 dangerous extension check
   6. Pool creator / fee rate check
+  7. RugCheck API — honeypot detection + risk scoring (free)
 
 A token passes safety if:
   - No dangerous SPL-2022 extensions
@@ -15,8 +16,6 @@ A token passes safety if:
   - Top-10 holder concentration < MAX_TOP_10_HOLDER_PCT
 
 NOTE: Mint authority NOT renounced is now a warning/penalty only, not a hard fail.
-Most early pump.fun tokens haven't renounced yet — killing them here was the reason
-the bot never fired a single alert.
 """
 
 from __future__ import annotations
@@ -36,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 BIRDEYE_BASE          = "https://public-api.birdeye.so"
 DEXSCREENER_BASE      = "https://api.dexscreener.com"
+RUGCHECK_BASE         = "https://api.rugcheck.xyz/v1"
 TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 BURN_ADDRESS          = "1nc1nerator11111111111111111111111111111111"
@@ -78,6 +78,10 @@ class SafetyResult:
     deployer_risk:             float = 0.0
     deployer_detail:           str = ""
     deployer_address:          str  = ""
+    # ── RugCheck fields ───────────────────────────────────────────────────────
+    rugcheck_score:            int  = -1
+    rugcheck_risks:            list = field(default_factory=list)
+    rugcheck_summary:          str  = ""
 
 
 class SafetyChecker:
@@ -320,35 +324,23 @@ class SafetyChecker:
         birdeye_data:         dict | None,
         dangerous_extensions: list,
         pool_warnings:        list,
-        is_bonding_curve:     bool = False,   # True = pre-graduation pump.fun
+        is_bonding_curve:     bool = False,
     ) -> tuple[bool, list[str]]:
         red_flags    = []
         instant_fail = False
 
-        # ── Hard fails (instant kill regardless of other signals) ──────────────
         if dangerous_extensions:
             for ext in dangerous_extensions:
                 red_flags.append(f"🚨 DANGEROUS EXTENSION: {ext}")
             instant_fail = True
 
         if not freeze_renounced:
-            # Only instant-fail if Birdeye explicitly confirmed freeze is active.
-            # If we just couldn't check (RPC timeout), treat as a warning only.
             if birdeye_data and birdeye_data.get("freezable") is True:
                 red_flags.append("🚨 Freeze authority ACTIVE (Birdeye confirmed)")
                 instant_fail = True
             else:
-                # RPC couldn't verify — warn but don't kill
                 red_flags.append("⚠️ Freeze authority status unverified (RPC timeout)")
 
-        # ── Mint authority check ──────────────────────────────────────────
-        # For bonding curve tokens (pre-graduation pump.fun):
-        #   Mint not renounced is EXPECTED — pump.fun burns it at graduation.
-        #   Show as a soft warning only.
-        # For graduated tokens (Pumpswap, Raydium, etc.):
-        #   Mint not renounced after graduation is a REAL red flag.
-        #   Pump.fun automatically revokes it at graduation — if it's still
-        #   active, something is wrong. Count it as a harder flag.
         if not mint_renounced:
             if is_bonding_curve:
                 red_flags.append(
@@ -360,7 +352,7 @@ class SafetyChecker:
                     "🚨 Mint authority NOT renounced — this token is already "
                     "on a DEX, mint should have been burned at graduation"
                 )
-                instant_fail = True   # Hard fail for graduated tokens
+                instant_fail = True
 
         if top10_pct > config.MAX_TOP_10_HOLDER_PCT:
             red_flags.append(f"⚠️ Top-10 holders own {top10_pct:.1f}% (dump risk)")
@@ -377,8 +369,6 @@ class SafetyChecker:
             if not birdeye_data.get("lpBurned") and lp_burned is None:
                 red_flags.append("⚠️ LP not burned (Birdeye)")
 
-        # Require 3+ soft flags to fail (was 2) — prevents a single "mint not
-        # renounced" + one other minor flag from killing every early token
         return instant_fail or len(red_flags) >= 3, red_flags
 
     # ── Deployer wallet history check ─────────────────────────────────────────
@@ -619,30 +609,11 @@ class SafetyChecker:
         else:
             description = ""
 
-        # Return buyer wallet list alongside risk so fresh wallet check can use it
         return risk, description, list(buyer_amounts.keys())
 
     async def _check_fresh_wallets(
         self, buyer_wallets: list[str], token_created_ts: float = 0
     ) -> tuple[float, str]:
-        """
-        Check if early buyers are fresh wallets — a major red flag for
-        coordinated launches and bundles.
-
-        Method:
-        - For each early buyer wallet, fetch their last 10 transactions
-        - If a wallet has fewer than 5 total transactions, it is brand new
-        - If multiple fresh wallets bought the same token = coordinated launch
-
-        Why this matters (from the guides):
-        - Fresh wallets funded from the same source buying at launch = bundle
-        - Real organic buyers have history — bots and coordinated wallets don't
-        - Multiple green leaf (fresh wallet) icons = instant red flag
-
-        Returns (risk_score, description)
-        0.0 = all wallets look organic
-        1.0 = highly coordinated fresh wallet attack
-        """
         if not config.has_helius or not buyer_wallets:
             return 0.0, ""
 
@@ -650,7 +621,6 @@ class SafetyChecker:
         checked_count = 0
         fresh_wallets = []
 
-        # Check up to 8 wallets to limit API calls
         wallets_to_check = buyer_wallets[:8]
 
         for wallet in wallets_to_check:
@@ -666,7 +636,6 @@ class SafetyChecker:
 
                 tx_count = len(result)
 
-                # Wallet with fewer than 5 lifetime transactions = fresh
                 if tx_count < 5:
                     fresh_wallets.append(wallet[:8])
                     fresh_count += 1
@@ -675,7 +644,6 @@ class SafetyChecker:
                         f"({tx_count} total txns)"
                     )
 
-                # Small delay to avoid hammering RPC
                 await asyncio.sleep(0.15)
 
             except Exception as e:
@@ -685,9 +653,8 @@ class SafetyChecker:
         if checked_count == 0 or fresh_count == 0:
             return 0.0, ""
 
-        fresh_ratio = fresh_count / checked_count
-        risk        = 0.0
-        flags       = []
+        risk  = 0.0
+        flags = []
 
         if fresh_count >= 4:
             risk = 0.9
@@ -718,10 +685,87 @@ class SafetyChecker:
 
         return risk, desc
 
+    # ── RugCheck API ──────────────────────────────────────────────────────────
+
+    def _parse_rugcheck(self, data: dict) -> dict:
+        """
+        Parse RugCheck API response.
+        Score: higher = more dangerous.
+          0–299   → Good    ✅
+          300–699 → Warning ⚠️
+          700+    → Danger  🚨
+        """
+        score    = int(data.get("score") or -1)
+        risks    = data.get("risks", []) or []
+        dangers  = [r for r in risks if r.get("level") == "danger"]
+        warnings = [r for r in risks if r.get("level") == "warn"]
+
+        if score < 0:
+            label, emoji = "Unknown", "⚪"
+        elif score < 300:
+            label, emoji = "Good",    "✅"
+        elif score < 700:
+            label, emoji = "Warning", "⚠️"
+        else:
+            label, emoji = "Danger",  "🚨"
+
+        notable  = [r.get("name", "") for r in (dangers + warnings)[:4] if r.get("name")]
+        risk_str = ", ".join(notable) if notable else "none flagged"
+        score_str = str(score) if score >= 0 else "N/A"
+        summary  = f"{emoji} RugCheck: {label} (score {score_str}) — {risk_str}"
+
+        return {
+            "score":         score,
+            "label":         label,
+            "emoji":         emoji,
+            "danger_count":  len(dangers),
+            "warn_count":    len(warnings),
+            "risks":         risks,
+            "summary":       summary,
+            "is_honeypot":   bool(data.get("isHoneypot", False)),
+        }
+
+    async def _check_rugcheck(self, mint: str) -> dict | None:
+        """
+        Query RugCheck API for token risk summary.
+        Free API — no key required for basic access.
+        Set RUGCHECK_API_KEY in .env for higher rate limits.
+        """
+        session = await self._get_session()
+        headers = {"Accept": "application/json"}
+        if config.RUGCHECK_API_KEY:
+            headers["Authorization"] = f"Bearer {config.RUGCHECK_API_KEY}"
+
+        try:
+            async with session.get(
+                f"{RUGCHECK_BASE}/tokens/{mint}/report",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status == 200:
+                    data   = await resp.json(content_type=None)
+                    parsed = self._parse_rugcheck(data)
+                    logger.info(
+                        f"[Safety] RugCheck {mint[:8]}: "
+                        f"{parsed['label']} (score {parsed['score']}) "
+                        f"dangers={parsed['danger_count']} warns={parsed['warn_count']}"
+                    )
+                    return parsed
+                elif resp.status == 429:
+                    logger.warning("[Safety] RugCheck rate limited — skipping")
+                else:
+                    logger.debug(f"[Safety] RugCheck HTTP {resp.status} for {mint[:8]}")
+                return None
+        except Exception as e:
+            logger.debug(f"[Safety] RugCheck error: {e}")
+            return None
+
+    # ── Main safety check ──────────────────────────────────────────────────────
+
     async def full_safety_check(
         self, mint: str, pool_address: str = "", dex_name: str = "",
         volume_24h: float = 0.0, liquidity: float = 0.0, txns_24h: int = 0,
-        token_source: str = ""   # "pumpfun" = still on bonding curve
+        token_source: str = ""
     ) -> SafetyResult:
         logger.info(f"[Safety] Running checks for {mint}")
         opp_volume_24h = volume_24h
@@ -737,6 +781,7 @@ class SafetyChecker:
             self._check_pool_safety(pool_address, dex_name),
             self._check_bundle(mint),
             self._check_deployer_history(mint),
+            self._check_rugcheck(mint),
             return_exceptions=True,
         )
 
@@ -755,7 +800,7 @@ class SafetyChecker:
         else:
             bundle_risk, bundle_desc, bundle_wallets = 0.0, "", []
 
-        # ── Fresh wallet check using early buyers from bundle detection ───────
+        # ── Fresh wallet check ────────────────────────────────────────────────
         fresh_risk   = 0.0
         fresh_desc   = ""
         if bundle_wallets:
@@ -763,6 +808,7 @@ class SafetyChecker:
                 fresh_risk, fresh_desc = await self._check_fresh_wallets(bundle_wallets)
             except Exception as e:
                 logger.debug(f"[Safety] Fresh wallet check error: {e}")
+
         deployer_result   = results[7] if not isinstance(results[7], Exception) else (0.0, "", "")
         if isinstance(deployer_result, tuple) and len(deployer_result) == 3:
             deployer_risk, deployer_desc, deployer_address = deployer_result
@@ -771,6 +817,9 @@ class SafetyChecker:
             deployer_address = ""
         else:
             deployer_risk, deployer_desc, deployer_address = 0.0, "", ""
+
+        # ── RugCheck result ───────────────────────────────────────────────────
+        rugcheck_result = results[8] if not isinstance(results[8], Exception) else None
 
         mint_renounced, freeze_renounced = mint_auth_result
         token_program, dangerous_extensions = extension_result
@@ -791,7 +840,6 @@ class SafetyChecker:
         elif bundle_risk >= 0.25 and bundle_desc:
             pool_warnings.append(f"⚠️ Bundle signals detected: {bundle_desc}")
 
-        # Fresh wallet warnings
         if fresh_risk >= 0.6 and fresh_desc:
             pool_warnings.append(f"🚨 FRESH WALLET ATTACK: {fresh_desc}")
             pool_warnings.append(f"🚨 FRESH WALLETS (2nd flag): auto-fail")
@@ -811,13 +859,34 @@ class SafetyChecker:
             opp_volume_24h, opp_liquidity, opp_txns_24h
         )
         if fake_vol_risk >= 0.7 and fake_vol_desc:
-            # Extreme fake volume = instant kill, count as 2 red flags
             pool_warnings.append(f"🚨 FAKE VOLUME CONFIRMED: {fake_vol_desc}")
             pool_warnings.append(f"🚨 FAKE VOLUME (2nd flag): auto-fail")
         elif fake_vol_risk >= 0.5 and fake_vol_desc:
             pool_warnings.append(f"🚨 FAKE VOLUME LIKELY: {fake_vol_desc}")
         elif fake_vol_risk >= 0.2 and fake_vol_desc:
             pool_warnings.append(f"⚠️ Volume quality concern: {fake_vol_desc}")
+
+        # ── RugCheck signal integration ───────────────────────────────────────
+        rc_score, rc_risks, rc_summary = -1, [], ""
+        if rugcheck_result:
+            rc_score   = rugcheck_result["score"]
+            rc_risks   = rugcheck_result["risks"]
+            rc_summary = rugcheck_result["summary"]
+
+            if rugcheck_result.get("is_honeypot"):
+                pool_warnings.append("🚨 RUGCHECK: HONEYPOT DETECTED")
+            elif rugcheck_result["danger_count"] >= 2:
+                danger_names = ", ".join(
+                    r.get("name", "") for r in rugcheck_result["risks"]
+                    if r.get("level") == "danger"
+                )
+                pool_warnings.append(
+                    f"🚨 RugCheck {rugcheck_result['danger_count']} danger flags: {danger_names}"
+                )
+            elif rugcheck_result["label"] == "Danger":
+                pool_warnings.append(f"⚠️ RugCheck Danger (score {rc_score})")
+            elif rugcheck_result["label"] == "Warning" and rc_score > 500:
+                pool_warnings.append(f"ℹ️ RugCheck Warning (score {rc_score})")
 
         is_bonding_curve = token_source == "pumpfun"
         is_honeypot, red_flags = self._check_honeypot_heuristics(
@@ -854,9 +923,6 @@ class SafetyChecker:
         if red_flags:
             summary += "\n\nRed flags:\n" + "\n".join(red_flags)
 
-        # ── FIXED: mint_renounced is no longer a hard requirement ─────────────
-        # Only freeze authority active and dangerous extensions are instant kills.
-        # Mint not renounced is surfaced as a warning in the briefing instead.
         final_passed = not is_honeypot
         if not final_passed:
             reasons = []
@@ -888,4 +954,7 @@ class SafetyChecker:
             deployer_risk=deployer_risk,
             deployer_detail=deployer_desc,
             deployer_address=deployer_address,
+            rugcheck_score=rc_score,
+            rugcheck_risks=rc_risks,
+            rugcheck_summary=rc_summary,
         )
