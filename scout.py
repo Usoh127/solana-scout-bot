@@ -34,8 +34,8 @@ import aiohttp
 
 from config import config
 from narrative_tracker import narrative_tracker
-from narrative_scout import narrative_scout, NarrativeCandidate
-from early_detector import holder_velocity, is_very_young, should_bypass_social_gate
+from narrative_scout import narrative_scout
+from early_detector import holder_velocity, is_very_young
 
 logger = logging.getLogger(__name__)
 
@@ -136,21 +136,19 @@ class TokenOpportunity:
     pumpfun_is_koth: bool = False
     pumpfun_bonding_progress: float = 0.0   # 0-100, how far to graduation
 
-    # Narrative discovery fields
-    narrative_theme:   str   = ""    # e.g. "AI / Agents"
-    narrative_heat:    str   = ""    # "hot" / "rising" / "cooling"
-    narrative_keyword: str   = ""    # keyword that matched
-    is_very_young:     bool  = False # under 20 min — bypass social gate
+    # Narrative discovery fields (set when found via narrative_scout)
+    narrative_theme:   str  = ""   # e.g. "AI / Agents", "Dogs"
+    narrative_heat:    str  = ""   # "hot" / "rising" / "cooling"
+    narrative_keyword: str  = ""   # exact keyword that matched
+    is_very_young:     bool = False  # under 20 minutes old
 
-    # Holder velocity
+    # Holder velocity (tracked across scan cycles)
     holder_velocity_pct: float = 0.0
     holder_velocity_str: str   = ""
 
-    # Deployer track record
-    deployer_win_count:  int   = 0
-    deployer_total:      int   = 0
-    deployer_win_bonus:  int   = 0
-    deployer_win_detail: str   = ""
+    # Deployer track record (from early_detector.DeployerWinRateChecker)
+    deployer_win_bonus:  int  = 0
+    deployer_win_detail: str  = ""
 
     first_seen: float = field(default_factory=time.time)
 
@@ -684,19 +682,24 @@ class TokenScout:
             return False, f"mcap ${mc:,.0f} < min ${config.MIN_MARKET_CAP_USD:,.0f}"
         if mc > config.MAX_MARKET_CAP_USD:
             return False, f"mcap ${mc:,.0f} > max ${config.MAX_MARKET_CAP_USD:,.0f}"
-        if age > config.MAX_TOKEN_AGE_HOURS:
-            return False, f"age {age:.1f}h > max {config.MAX_TOKEN_AGE_HOURS}h"
 
-        # PRIMARY scan: tokens under 6 hours only
-        # SECONDARY: allow older tokens only if they have exceptional signals
-        PRIMARY_MAX_AGE = 6.0
-        if age > PRIMARY_MAX_AGE:
-            # Older tokens need exceptional price action to qualify
-            if p1h < 50 and not is_pumpfun:
-                return False, (
-                    f"age {age:.1f}h > {PRIMARY_MAX_AGE}h primary window "
-                    f"(needs 50%+ 1h momentum to override)"
-                )
+        # Age filter — narrative tokens bypass the 6h primary window
+        # (they are found specifically because they're pre-graduation / very early)
+        is_narrative = source == "narrative"
+        if is_narrative:
+            # Narrative tokens: only enforce the hard max age ceiling
+            if age > config.MAX_TOKEN_AGE_HOURS:
+                return False, f"age {age:.1f}h > max {config.MAX_TOKEN_AGE_HOURS}h"
+        else:
+            # Normal tokens: 6h soft window for non-pumpfun tokens without strong momentum
+            if age > 6.0 and not is_pumpfun:
+                if p1h < 50:
+                    return False, (
+                        f"age {age:.1f}h > 6h primary window "
+                        f"(needs 50%+ 1h momentum to qualify — got {p1h:.0f}%)"
+                    )
+            if age > config.MAX_TOKEN_AGE_HOURS:
+                return False, f"age {age:.1f}h > max {config.MAX_TOKEN_AGE_HOURS}h"
 
         # Price change: skip for pump.fun
         if not is_pumpfun and p1h < config.MIN_PRICE_CHANGE_1H:
@@ -792,34 +795,35 @@ class TokenScout:
             elif isinstance(result, Exception):
                 logger.warning(f"[Scout] Source error: {result}")
 
-        # Convert narrative candidates to dict format compatible with dedup
+        # Convert narrative candidates into the same dict format
         if isinstance(narrative_results, list):
             for nc in narrative_results:
                 raw.append({
-                    "mint":                    nc.mint,
-                    "name":                    nc.name,
-                    "symbol":                  nc.symbol,
-                    "pool_address":            nc.pool_address,
-                    "dex":                     nc.dex,
-                    "price_usd":               nc.price_usd,
-                    "market_cap_usd":          nc.market_cap_usd,
-                    "fdv_usd":                 nc.market_cap_usd,
-                    "liquidity_usd":           nc.liquidity_usd,
-                    "volume_24h_usd":          nc.volume_24h_usd,
-                    "volume_6h_usd":           nc.volume_6h_usd,
-                    "volume_1h_usd":           nc.volume_1h_usd,
-                    "price_change_1h":         nc.price_change_1h,
-                    "price_change_6h":         nc.price_change_6h,
-                    "price_change_24h":        nc.price_change_24h,
-                    "launched_at":             nc.launched_at,
-                    "age_hours":               nc.age_hours,
-                    "source":                  "narrative",
-                    "narrative_theme":         nc.matched_theme,
-                    "narrative_heat":          nc.narrative_heat,
-                    "narrative_keyword":       nc.matched_keyword,
-                    "is_very_young":           nc.is_very_young,
+                    "mint":                     nc.mint,
+                    "name":                     nc.name,
+                    "symbol":                   nc.symbol,
+                    "pool_address":             nc.pool_address,
+                    "dex":                      nc.dex,
+                    "price_usd":                nc.price_usd,
+                    "market_cap_usd":           nc.market_cap_usd,
+                    "fdv_usd":                  nc.market_cap_usd,
+                    "liquidity_usd":            nc.liquidity_usd,
+                    "volume_24h_usd":           nc.volume_24h_usd,
+                    "volume_6h_usd":            nc.volume_6h_usd,
+                    "volume_1h_usd":            nc.volume_1h_usd,
+                    "price_change_1h":          nc.price_change_1h,
+                    "price_change_6h":          nc.price_change_6h,
+                    "price_change_24h":         nc.price_change_24h,
+                    "launched_at":              nc.launched_at,
+                    "age_hours":                nc.age_hours,
+                    "source":                   "narrative",
+                    "narrative_theme":          nc.matched_theme,
+                    "narrative_heat":           nc.narrative_heat,
+                    "narrative_keyword":        nc.matched_keyword,
+                    "is_very_young":            nc.is_very_young,
                     "pumpfun_bonding_progress": nc.bonding_progress,
                 })
+            logger.info(f"[Scout] Narrative scout added {len(narrative_results)} candidates")
         elif isinstance(narrative_results, Exception):
             logger.warning(f"[Scout] Narrative scout error: {narrative_results}")
 
@@ -851,6 +855,10 @@ class TokenScout:
 
             narrative_tracker.record_token(t.get("name", ""), t.get("symbol", ""), passed=True)
 
+            # Record holder velocity snapshot (if holder count available later from safety)
+            # We snapshot market cap as a proxy for now; safety check updates the real count
+            _age_h = t["age_hours"]
+
             opp = TokenOpportunity(
                 mint=mint,
                 name=t["name"],
@@ -868,7 +876,7 @@ class TokenScout:
                 price_change_6h=t["price_change_6h"],
                 price_change_24h=t["price_change_24h"],
                 launched_at=t.get("launched_at"),
-                age_hours=t["age_hours"],
+                age_hours=_age_h,
                 possible_copycat=t.get("possible_copycat", False),
                 original_ca=t.get("original_ca", ""),
                 dex_paid=t.get("dex_paid", False),
@@ -876,17 +884,12 @@ class TokenScout:
                 pumpfun_reply_count=t.get("pumpfun_reply_count", 0),
                 pumpfun_is_koth=t.get("pumpfun_is_koth", False),
                 pumpfun_bonding_progress=t.get("pumpfun_bonding_progress", 0.0),
+                # Narrative discovery fields
+                narrative_theme=t.get("narrative_theme", ""),
+                narrative_heat=t.get("narrative_heat", ""),
+                narrative_keyword=t.get("narrative_keyword", ""),
+                is_very_young=t.get("is_very_young", is_very_young(_age_h)),
             )
-            # Record holder count snapshot for velocity tracking on next cycle
-            # (holder count comes from safety check later, but we can snapshot mcap
-            #  as a proxy — actual holder recording happens after safety check)
-            if t.get("source") == "narrative":
-                opp.data_only_call   = t.get("is_very_young", False)
-                opp.data_only_reason = (
-                    f"Narrative match: {t.get('narrative_theme', '')} "
-                    f"({t.get('narrative_heat', '')}), "
-                    f"keyword: {t.get('narrative_keyword', '')}"
-                )
             opportunities.append(opp)
 
         logger.info(f"[Scout] {len(opportunities)} opportunities passed thresholds")
