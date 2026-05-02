@@ -620,7 +620,31 @@ class PositionMonitor:
 
     # ── Determine trailing stop % for this position ────────────────────────────
 
-    def _trailing_stop_pct(self, pos: Position) -> float:
+    def _trailing_stop_pct(self, pos: Position, ta_result=None) -> float:
+        """
+        Returns the trailing stop drawdown % for this position.
+        Uses ATR-based stop from TA result when available, subject to
+        the existing floors for new/fast-pump tokens.
+        """
+        # Compute base floor from existing age/pump logic
+        if pos.tp2_hit:
+            floor_pct = 20.0
+        elif pos.fast_pump_detected:
+            floor_pct = 15.0
+        elif pos.token_age_at_buy < (5 / 60):
+            floor_pct = 15.0
+        elif pos.token_age_at_buy < 0.5:
+            floor_pct = 20.0
+        else:
+            floor_pct = 25.0
+
+        # Use ATR-based stop if available and meaningful
+        if ta_result is not None and ta_result.suggested_stop_pct > 0:
+            atr_stop = ta_result.suggested_stop_pct
+            # Never go below the floor (protects very young / fast-pump tokens)
+            return max(floor_pct, atr_stop)
+
+        return floor_pct
         """
         Returns the trailing stop drawdown % to use for this position.
 
@@ -814,7 +838,7 @@ class PositionMonitor:
         # Tightness depends on token age and pump velocity
         # ════════════════════════════════════════════════════════════════════════
         if pos.peak_price > 0 and pos.tokens_remaining > 0:
-            trail_pct     = self._trailing_stop_pct(pos)
+            trail_pct = self._trailing_stop_pct(pos, getattr(pos, "ta_result", None))
             drawdown      = (
                 (pos.peak_price - current_price) / pos.peak_price
             ) * 100

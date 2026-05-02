@@ -273,6 +273,28 @@ def _compute_confidence(opp: TokenOpportunity) -> tuple[int, str]:
         score += 1
         reasons.append("📈 strong holder velocity")
 
+    # ── TA signal integration ─────────────────────────────────────────────
+    ta = getattr(opp, "ta_result", None)
+    if ta is not None and ta.ta_verdict != "UNKNOWN":
+        if ta.ta_verdict == "STRONG":
+            score += 2
+            reasons.append("strong TA setup 📐")
+        elif ta.ta_verdict == "DECENT":
+            score += 1
+            reasons.append("decent TA setup 📐")
+        elif ta.ta_verdict == "AVOID":
+            score -= 2
+            penalties.append("TA: avoid signal")
+        if ta.bearish_divergence:
+            score -= 1
+            penalties.append("bearish RSI divergence")
+        if ta.is_extended:
+            score -= 1
+            penalties.append("price extended >3×ATR")
+        if ta.entry_pattern != "none":
+            score += 1
+            reasons.append(f"clean entry: {ta.entry_pattern}")
+    
     score = max(1, min(10, score))
     rationale = " · ".join((reasons[:2] + penalties[:2]))
     return score, rationale
@@ -437,6 +459,37 @@ def _assess_entry_quality(opp: TokenOpportunity) -> tuple[str, str, str]:
     else:
         return "D", "Avoid chasing", explanation
 
+def _build_ta_block(opp: TokenOpportunity) -> str:
+    """Build the TA read section for the briefing."""
+    ta = getattr(opp, "ta_result", None)
+    if ta is None:
+        return ""
+
+    if ta.ta_verdict == "UNKNOWN":
+        return (
+            "📐 <b>Technical Read</b>: Pre-graduation token — TA unavailable, "
+            "on-chain data only\n\n"
+        )
+
+    verdict_emoji = {
+        "STRONG": "🟢", "DECENT": "🔵", "CAUTION": "🟡", "AVOID": "🔴"
+    }.get(ta.ta_verdict, "⚪")
+
+    rsi_str  = f"{ta.rsi:.0f}" if ta.rsi is not None else "N/A"
+    stop_str = f"{ta.suggested_stop_pct:.1f}%" if ta.suggested_stop_pct > 0 else "N/A"
+
+    lines = [
+        f"📐 <b>Technical Read</b>: {verdict_emoji} {ta.ta_verdict}",
+        f"  {html.escape(ta.ta_summary)}",
+        f"  RSI: {rsi_str}  |  Trend: {ta.trend}  |  Pattern: {ta.entry_pattern}",
+    ]
+    if ta.is_extended:
+        lines.append("  ⚠️ <i>Price extended >3×ATR — late entry risk</i>")
+    if ta.bearish_divergence:
+        lines.append("  ⚠️ <i>Bearish RSI divergence detected</i>")
+    lines.append(f"  🛑 Suggested stop: {stop_str} (ATR-based)")
+    lines.append("")
+    return "\n".join(lines) + "\n"
 
 def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
     """Build the formatted Telegram briefing message + action buttons."""
@@ -600,6 +653,7 @@ def _build_briefing(opp: TokenOpportunity) -> tuple[str, InlineKeyboardMarkup]:
         f"{conf_emoji} <b>Confidence: {opp.confidence}/10</b>\n"
         f"<i>{html.escape(opp.confidence_rationale)}</i>\n\n"
         f"{entry_block}"
+        f"{_build_ta_block(opp)}"
         f"{narrative_match_line}"
         f"{'━' * 28}\n"
         + (f"{narrative_section}\n{'━' * 28}\n" if narrative_section else "")
@@ -1491,6 +1545,18 @@ async def _run_scan_cycle(
                     logger.info(
                         f"[Bot] {opp.symbol} skipped — confidence {opp.confidence}/10 "
                         f"below {min_conf} required during {window_name}"
+                    )
+                    continue
+
+                # ── TA filter ─────────────────────────────────────────────
+                from ta_filter import run_ta_analysis
+                ta_result = await run_ta_analysis(opp.pool_address, opp.price_usd)
+                opp.ta_result = ta_result
+
+                if ta_result.ta_verdict == "AVOID" and opp.confidence < 7:
+                    logger.info(
+                        f"[Bot] {opp.symbol} dropped by TA filter: "
+                        f"{ta_result.ta_summary}"
                     )
                     continue
 
